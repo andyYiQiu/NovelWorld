@@ -1,4 +1,4 @@
-# Publish only the files used to run experiments and their license notices.
+# Publish the experiment runtime, README and license texts.
 *
 !*/
 !/.gitignore
@@ -15,7 +15,7 @@
 !/storage/**/*.py
 !/workflows/**/*.py
 !/prompts/*.md
-!/THIRD_PARTY_NOTICES.md
+!/README.md
 !/LICENSES/*.txt
 
 # Keep private inputs, outputs and development material local.
