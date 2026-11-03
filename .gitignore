@@ -2,7 +2,7 @@
 *
 !*/
 !/.gitignore
-!/novel_restore.py
+!/main.py
 !/requirements.txt
 !/configs/example/simulation.json
 !/configs/example/narrative.json

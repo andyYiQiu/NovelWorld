@@ -30,7 +30,7 @@ class NovelRestoreWorkflow:
         if config.backend == "scripted" and (not isinstance(backend, dict) or any(not isinstance(value, list) for value in backend.values())):
             raise ValueError("scripted 文件须为任务身份到响应列表的映射")
         root = Path(__file__).resolve().parents[1]
-        files = [root / "requirements.txt", root / "model/ModelClient.py", root / "novel_restore.py"]
+        files = [root / "requirements.txt", root / "model/ModelClient.py", root / "main.py"]
         files.extend((root / "contract").rglob("*.py"))
         for directory, pattern in (("agents", "NovelRestore*.py"), ("common", "*.py"),
                                    ("storage", "*.py"),

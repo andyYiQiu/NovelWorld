@@ -59,7 +59,7 @@ def main(argv=None):
                     if code == 0 and narrative is not None:
                         code, result = asyncio.run(NovelRestoreWorkflow.narrate(config.run_directory, config=narrative))
             except (JobFailed, ModelResponseError) as error:
-                print(f"novel_restore: {error}", file=sys.stderr)
+                print(f"main.py: {error}", file=sys.stderr)
                 return 1
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return code
@@ -69,7 +69,7 @@ def main(argv=None):
             result = storage.narrative_status(args.version) if args.command == "status" and args.version else storage.status()
             print(json.dumps(result, ensure_ascii=False, indent=2))
     except (OSError, ValueError, sqlite3.Error) as error:
-        print(f"novel_restore: {error}", file=sys.stderr)
+        print(f"main.py: {error}", file=sys.stderr)
         return 1
     return 0
 

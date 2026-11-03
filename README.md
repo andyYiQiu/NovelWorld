@@ -9,7 +9,7 @@ NovelWorld 直接读取 NovelHarness 导出的一本小说的 JSON/JSONL 目录�
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -B novel_restore.py --help
+.venv/bin/python -B main.py --help
 ```
 
 在项目根目录创建 `repository/`，将你自己的**单本小说完整导出目录**放入其中，保留上游文件名和目录层级。例如，`repository/祝福_正式115/` 下包含 `timeline/timeline.json`、各时间节点的任务和状态快照，以及 `roles/`、`objects/`、`locations/`、`worlds/` 中的已有资料。每本书或每个版本单独放一个目录。
@@ -29,21 +29,21 @@ cp -R configs/example configs/exp-001
 **运行模拟**。示例模型从环境变量 `DEEPSEEK_API_KEY` 读取密钥。设置后，用本次实验的配置启动。两份配置均可通过 `model_config_path` 选用各自的[模型配置](model/config.example.json)。
 
 ```bash
-.venv/bin/python -B novel_restore.py run --config configs/exp-001/simulation.json
+.venv/bin/python -B main.py run --config configs/exp-001/simulation.json
 ```
 
 若要先离线检查输入，可先用 `init` 初始化，再用 `status` 查看。准备好模型后用 `resume` 继续该运行。
 
 ```bash
-.venv/bin/python -B novel_restore.py init --config configs/exp-001/simulation.json
-.venv/bin/python -B novel_restore.py status --run-directory runs/exp-001
-.venv/bin/python -B novel_restore.py resume --run-directory runs/exp-001
+.venv/bin/python -B main.py init --config configs/exp-001/simulation.json
+.venv/bin/python -B main.py status --run-directory runs/exp-001
+.venv/bin/python -B main.py resume --run-directory runs/exp-001
 ```
 
 **生成叙述**。完整模拟结束后，可以按本次实验的叙述配置生成正文。同一份模拟需要比较不同写法时，可另存一份叙述配置并设置新的 `version_id`。
 
 ```bash
-.venv/bin/python -B novel_restore.py narrate --run-directory runs/exp-001 --config configs/exp-001/narrative.json
+.venv/bin/python -B main.py narrate --run-directory runs/exp-001 --config configs/exp-001/narrative.json
 ```
 
 `retry --help` 说明如何从指定事件组的检查点创建独立尝试。运行目录中的 `run.sqlite3` 保存状态与进度，`story_progress.md` 展示已提交的模拟材料，叙述版本放在 `narratives/<版本编号>/`。
@@ -52,7 +52,7 @@ cp -R configs/example configs/exp-001
 
 | 位置 | 职责 |
 | --- | --- |
-| `novel_restore.py`、`workflows/` | 命令入口、执行配置绑定、模拟及叙述生命周期 |
+| `main.py`、`workflows/` | 命令入口、执行配置绑定、模拟及叙述生命周期 |
 | `contract/` | JSON/JSONL 导出读取、公开 SQLite 查询、六类状态协议及回放 |
 | `agents/`、`common/` | 世界和人物行动、个人知情范围、故事草稿、叙述规划与核对 |
 | `model/`、`prompts/` | 模型适配器、执行配置示例及角色提示 |
