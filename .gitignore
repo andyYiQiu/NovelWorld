@@ -1,0 +1,32 @@
+# Publish only the files used to run experiments and their license notices.
+*
+!*/
+!/.gitignore
+!/novel_restore.py
+!/requirements.txt
+!/simulation.example.json
+!/narrative.example.json
+!/model/config.example.json
+!/agents/**/*.py
+!/common/**/*.py
+!/contract/**/*.py
+!/exporters/**/*.py
+!/model/**/*.py
+!/storage/**/*.py
+!/workflows/**/*.py
+!/prompts/*.md
+!/THIRD_PARTY_NOTICES.md
+!/LICENSES/*.txt
+
+# Keep private inputs, outputs and development material local.
+/docs/
+/tests/
+/repository/
+/.venv/
+/runs/
+/input/
+/output/
+/logs/
+/reports/
+__pycache__/
+.pytest_cache/

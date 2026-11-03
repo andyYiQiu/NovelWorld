@@ -1,0 +1,6 @@
+{
+  "version_id": "v1",
+  "requirements": "以第三人称叙述，保留模拟中已经发生的事实和各人物的知情范围。",
+  "model_config_path": "model/config.example.json",
+  "max_calls": 1000
+}
