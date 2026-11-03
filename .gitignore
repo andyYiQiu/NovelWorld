@@ -4,8 +4,8 @@
 !/.gitignore
 !/novel_restore.py
 !/requirements.txt
-!/simulation.example.json
-!/narrative.example.json
+!/configs/example/simulation.json
+!/configs/example/narrative.json
 !/model/config.example.json
 !/agents/**/*.py
 !/common/**/*.py

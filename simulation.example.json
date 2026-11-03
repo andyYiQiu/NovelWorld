@@ -1,6 +1,0 @@
-{
-  "repository": "repository/祝福_正式115",
-  "run_directory": "runs/example",
-  "model_config_path": "model/config.example.json",
-  "max_calls": 1000
-}
