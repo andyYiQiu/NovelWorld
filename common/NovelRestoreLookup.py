@@ -13,11 +13,11 @@ from common.NovelRestoreObjects import object_assets, effective_catalog
 
 class WorldQuery(Record):
     kind: Literal["index", "asset", "background", "node", "group", "event", "reference_before",
-                  "reference_after", "current", "subjective", "memories", "history", "action"]
+                  "reference_after", "current", "subjective", "memories", "history", "action", "decision"]
     identity: Identity = Field(description="精确编号，不支持关键词搜索。kind=index 时只能填 assets/background/timeline；"
         "asset 用资产编号；background 用背景目录返回的文件路径；node 用节点编号；group 用组编号；"
         "event/reference_before/reference_after 用事件编号；current 用所属类别中的记录编号，relations 用关系任一端编号；"
-        "subjective/memories 用人物编号；history 用 category 对应的编号；action 用已提交行动编号。未知编号先查目录，不编造编号。")
+        "subjective/memories 用人物编号；history 用 category 对应的编号；action/decision 用已提交行动编号。未知编号先查目录，不编造编号。")
     category: str = Field(default="", description="kind=asset 或 index+assets 时必填 role/object/location/rule/organization；"
         "kind=current 时必填 characters/objects/locations/relations/public_state/constraints（注意为状态类别，不是资产类别）；"
         "kind=history 时必填 event/person/object/location；其余查询省略。"
@@ -38,8 +38,9 @@ class WorldLookup:
                  "views": self.storage.get_checkpoint("views", {}),
                  "person_runtime": self.storage.get_checkpoint("person_runtime", {}),
                  "runtime_objects": self.storage.get_checkpoint("runtime_objects", {}),
+                 "profiles": self.storage.get_checkpoint("self_profiles", {}),
                  "subjective": [tuple(row) for row in self.storage.connection.execute(
-                     "SELECT key,payload FROM checkpoints WHERE key LIKE 'character/%' OR key LIKE 'summaries/%' ORDER BY key")]}
+                     "SELECT key,payload FROM checkpoints WHERE key LIKE 'character/%' OR key LIKE 'summaries/%' OR key LIKE 'access/%' ORDER BY key")]}
         return sha256(encode(value).encode()).hexdigest()
 
     def query(self, request, *, stamp, allow_timeline=True):
@@ -127,6 +128,8 @@ class WorldLookup:
             view = self.storage.get_checkpoint("views", {}).get(identity)
             data = {"profile": self.storage.manifest["characters"][identity],
                     "current": self.storage.character_state(identity).model_dump(mode="json"),
+                    "personal_profile": self.storage.get_checkpoint("self_profiles", {}).get(identity),
+                    "available_input": self.storage.get_checkpoint("access/" + identity),
                     "view": view, "runtime": self.storage.get_checkpoint("person_runtime", {}).get(identity, {}),
                     "summaries": self.storage.memory_summaries(identity)}
         elif kind == "memories":
@@ -134,12 +137,18 @@ class WorldLookup:
             page = rows[request.after:request.after + request.limit]
             data = {"items": [m.model_dump(mode="json") for m in page],
                     "next": request.after + len(page) if request.after + len(page) < len(rows) else None}
-        elif kind == "action":
+        elif kind in ("action", "decision"):
             row = self.storage.connection.execute("SELECT payload FROM actions WHERE action_id=? AND status='committed' AND version<=?", (identity, version)).fetchone()
             if row is None:
                 raise ValueError("已提交行动不存在")
             data = json.loads(row[0])
-            if not allow_timeline:
+            if kind == "decision":
+                from agents.NovelRestoreAgent import task_id
+                pos = data["position"]
+                job = self.storage.get_job(task_id("character", pos["event_id"], pos["round"], pos["turn"])) or {}
+                data = {"character_id": data["proposal"]["character_id"], "attempt": data["proposal"],
+                        "recorded_candidates": job.get("result"), "scope": "人物主观推演。只有最终尝试另经裁定后才能成为故事事实。"}
+            elif not allow_timeline:
                 data.pop("completion", None)
         else:
             if request.category == "event":

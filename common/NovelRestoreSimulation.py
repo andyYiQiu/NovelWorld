@@ -31,6 +31,11 @@ class NovelRestoreSimulation:
                     continue
                 self.storage.enter_group(group.order)
                 self.storage.save_group_start(group)
+                if (group.order == 1 and self.storage.config.max_timelines > 1
+                        and node["node_id"] != self.storage.manifest.get("fork_node_id")
+                        and await self.world.consider_branch(group)):
+                    self.storage.mark_stage("branch_ready")
+                    return True
                 if not await self.simulate_group(group):
                     self.storage.mark_stage("incomplete", "当前事件组未满足全部事件及世界目标")
                     return False
@@ -111,8 +116,7 @@ class NovelRestoreSimulation:
                     if not achieved:
                         achieved = await self.world.assess_group(group)
                     if achieved:
-                        for identity, event in events.items():
-                            await self.world.build_draft(group, event)
+                        self.storage.archive_group(group.group_id)
                         await self.world.summarize_group(group)
                         return True
                     if not any(self.storage.event_states()[e]["status"] == "running" for e in events):

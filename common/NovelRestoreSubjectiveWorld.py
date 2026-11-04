@@ -57,22 +57,42 @@ class NovelRestoreSubjectiveWorld:
         return words
 
     @classmethod
+    def _rank(cls, records, terms, entities=(), single_chars=()):
+        """按正文词项与可选实体重合排序，同分优先较新的记录。"""
+        scores = []
+        entities = set(entities)
+        for index, row in enumerate(records):
+            content_terms = cls._terms(row.content)
+            content_terms.update(t for t in single_chars if t in row.content)
+            overlap = len(terms & content_terms) / max(1, len(terms | content_terms))
+            score = len(entities.intersection(row.role_ids + row.object_ids + row.location_ids)) + overlap
+            if score > 0:
+                scores.append((score * (1 + row.importance / 10), index, row))
+        scores.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [row for _, _, row in scores]
+
+    @classmethod
+    def search(cls, records, query, limit):
+        """主动回想只取问题文字的匹配项，不用时间、评分或纠正关联单独构成命中。"""
+        # 常见问句成分不能把“谁跟我提过雨伞放在哪里”当成钥匙问题的答案。
+        content = re.sub(r"谁跟我|谁告诉我|谁说过|跟我|告诉我|提过|说过|放在|哪里|哪儿|什么|"
+                         r"\b(?:who|what|where|when|how|was|were|the|and|did|does|to|in|is|are)\b",
+                         " ", query.casefold())
+        terms = cls._terms(content)
+        if not terms or limit <= 0:
+            return []
+        single_chars = {t for t in terms if len(t) == 1 and "\u3400" <= t <= "\u9fff"}
+        return cls._rank(records, terms, single_chars=single_chars)[:limit]
+
+    @classmethod
     def select(cls, records, *, query="", related_ids=(), recent=5, relevant=10):
-        """对已按人物和获知时点过滤的记录检索，多个查询复用同一份可见资料。"""
+        """世界侧查阅可结合近期经历和纠正链；不用于人物主动提问。"""
         if recent < 0 or relevant < 0:
             raise ValueError("检索数量不能为负")
         records = sorted(records, key=lambda row: row.position.sort_key)
-        terms, entities = cls._terms(query), set(related_ids)
-        scores = []
-        for index, row in enumerate(records):
-            content_terms = cls._terms(row.content)
-            overlap = len(terms & content_terms) / max(1, len(terms | content_terms))
-            score = len(entities & set(row.role_ids + row.object_ids + row.location_ids)) + overlap
-            if score > 0:
-                scores.append((score * (1 + row.importance / 10), index, row))
+        ranked = cls._rank(records, cls._terms(query), related_ids)
         selected = {row.memory_id for row in records[-recent:]} if recent else set()
-        scores.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        selected.update(row.memory_id for _, _, row in scores[:relevant])
+        selected.update(row.memory_id for row in ranked[:relevant])
         return cls.with_corrections(records, selected)
 
     @staticmethod

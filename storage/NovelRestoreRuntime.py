@@ -2,16 +2,37 @@
 from collections import defaultdict
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from hashlib import sha256
+import ctypes
 import json
+import os
+import re
+import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from contract.NovelWorldState import merge_deltas
 from common.Runtime import RunStopped
-from common.NovelRestoreSchema import CharacterState, ConfirmedAction, EventOutcome, StatePatch, WorldPerception
+from common.NovelRestoreSchema import CharacterState, ConfirmedAction, EventOutcome, RecallExperience, StatePatch, WorldPerception
 from common.NovelRestoreWorldState import apply_patch, validate_references, validate_result_evidence
 from common.NovelRestoreObjects import effective_catalog, validate_registrations
 
 CALL_ROLE = ContextVar("novel_restore_call_role", default=None)
+
+
+def _publish_fork(staged, destination):
+    """同一文件系统原子发布，竞争者或用户创建的空目录同样不能覆盖。"""
+    libc = ctypes.CDLL(None, use_errno=True)
+    src, dst = os.fsencode(staged), os.fsencode(destination)
+    if sys.platform == "darwin":
+        code = libc.renamex_np(src, dst, 4)  # RENAME_EXCL
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        code = libc.renameat2(-100, src, -100, dst, 1)  # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise OSError("当前平台不支持新分支目录的原子无覆盖发布")
+    if code:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), str(destination))
 
 
 class NovelRestoreRuntime:
@@ -44,6 +65,10 @@ class NovelRestoreRuntime:
             for mapping in view.correspondences:
                 if mapping.actual_kind not in ("none", "unknown") and mapping.actual_id not in catalog[mapping.actual_kind]:
                     raise ValueError("主客观对应关系引用未知真实对象")
+                if (mapping.actual_kind in ("role", "unknown") and
+                        (not re.fullmatch(r"p[1-9][0-9]{0,5}", mapping.perceived_id)
+                         or mapping.perceived_id in catalog["role"])):
+                    raise ValueError("人物或身份未定的感知对象只能用 p1、p2 等中性局部编号，且不能与人物档案编号相同")
 
     def validate_resolved_targets(self, proposal, before_view, resolved, catalog=None):
         mappings = {m.perceived_id: m for m in before_view.correspondences} if before_view else {}
@@ -79,7 +104,12 @@ class NovelRestoreRuntime:
         if (sorted(a.position.round for a in actions) != list(range(clock["round"], clock["round"] + len(actions)))
                 or any(a.position.turn != clock["batch"] for a in actions)):
             raise ValueError("每个行为须恰好占用一个连续轮号，并绑定当前共同批次")
+        requests = {row["action_id"]: row for row in saved}
         for action in actions:
+            row = requests[action.action_id]
+            if (action.proposal.character_id != row.get("character_id")
+                    or action.recollections_before != RecallExperience.from_action_context(row.get("context", {}))):
+                raise ValueError("行动者和行动前回想须与当时实际提交给该人物的上下文一致")
             if action.completion is None:
                 raise ValueError("批次行动必须包含事件完成判断")
             self._validate_action(action, catalog=catalog, validate_state=False)
@@ -263,14 +293,21 @@ class NovelRestoreRuntime:
         self.mark_stage("incomplete", reason)
 
     def save_group_start(self, group):
-        key = "group_start/" + group.group_id
+        self._save_group_start(group.group_id)
+
+    def _save_group_start(self, group_id):
+        key = "group_start/" + group_id
         if self.get_checkpoint(key):
             return
         # 同一个只写者持有锁；副本用于新尝试，当前运行不会回滚。
         tables = ("runtime", "event_progress", "checkpoints")
         data = {table: [dict(row) for row in self.connection.execute("SELECT * FROM " + table)] for table in tables}
         # 不将更早组的完整检查点副本再嵌套保存，避免随组数指数增长。
-        data["checkpoints"] = [row for row in data["checkpoints"] if not row["key"].startswith(("group_start/", "export", "execution_binding"))]
+        data["checkpoints"] = [row for row in data["checkpoints"] if not row["key"].startswith(("group_start/", "export", "execution_binding", "selection/", "branch_"))]
+        # 行动带世界版本，账本和草稿则各自追加。保存其精确上界，之后可从历史节点派生。
+        data["last_call_id"] = self.connection.execute("SELECT coalesce(max(id),0) FROM calls").fetchone()[0]
+        data["pending_call_ids"] = [row[0] for row in self.connection.execute("SELECT id FROM calls WHERE ended IS NULL")]
+        data["last_draft_rowid"] = self.connection.execute("SELECT coalesce(max(rowid),0) FROM drafts").fetchone()[0]
         self.set_checkpoint(key, data)
 
     @classmethod
@@ -293,67 +330,206 @@ class NovelRestoreRuntime:
                 transient = {"wave", "pending_wave", "round_schedule", "round_context", "round_perception", "round_access"}
                 snapshot["checkpoints"] = [row for row in snapshot["checkpoints"]
                     if row["key"] not in transient
-                    and not row["key"].startswith(("export", "execution_binding", "access/", "visibility/", "semantic_"))]
+                    and not row["key"].startswith(("export", "execution_binding", "access/", "visibility/", "semantic_", "selection/", "branch_"))]
                 progress = {k: v for k, v in progress.items() if k != "error"}
                 snapshot["runtime"][0]["progress"] = json.dumps({**progress, "stage": "simulating"})
             config = source.config.model_copy(update={"run_directory": Path(destination).expanduser().resolve(),
-                                                       "seed": source.config.seed + (not preserve_progress)})
-            prefix_version = snapshot["runtime"][0]["version"]
-            snapshot["actions"] = [dict(row) for row in source.connection.execute(
-                "SELECT * FROM actions WHERE status='committed' AND version<=? ORDER BY version", (prefix_version,))]
-            completed = {row["event_id"] for row in snapshot["event_progress"] if row["status"] == "completed"}
-            snapshot["drafts"] = [dict(row) for row in source.connection.execute("SELECT * FROM drafts") if row["event_id"] in completed]
-            if preserve_progress:
-                # 个人当前感知还原为已提交批次的反馈，未提交轮次重新感知并审核。
-                views = {}
-                for row in snapshot["actions"]:
-                    action = json.loads(row["payload"])
-                    views.update((action.get("advance") or {}).get("final_views", {}))
-                snapshot["checkpoints"] = [row for row in snapshot["checkpoints"] if row["key"] != "views"]
-                snapshot["checkpoints"].append({"key": "views", "payload": json.dumps(views, ensure_ascii=False)})
-            child = cls.create(config)
-            try:
-                exports = [dict(row) for row in child.connection.execute("SELECT * FROM checkpoints WHERE key LIKE 'export/%'")]
+                                                       "seed": source.config.seed + (not preserve_progress),
+                                                       "branch_plan": None, "max_timelines": 1})
+            with cls.create(config) as child:
                 manifest = {**child.manifest, "parent_run_id": source.run_id, "retry_group_id": group_id}
                 if preserve_progress:
-                    manifest["resume_after_version"] = prefix_version
-                with child.connection:
-                    for table in ("actions", "event_progress", "checkpoints", "drafts"):
-                        child.connection.execute("DELETE FROM " + table)
-                        for row in snapshot[table]:
-                            if table == "event_progress" and row["outcome"]:
-                                outcome = json.loads(row["outcome"])
-                                outcome["run_id"] = child.run_id
-                                row = {**row, "outcome": json.dumps(outcome, ensure_ascii=False)}
-                            if table in ("actions", "drafts"):
-                                raw = json.loads(row["payload"])
-                                raw["run_id"] = child.run_id
-                                memories = raw.get("memories", []) + (raw.get("advance") or {}).get("memories", [])
-                                for memory in memories:
-                                    memory["run_id"] = child.run_id
-                                row = {**row, "payload": json.dumps(raw, ensure_ascii=False)}
-                            columns = list(row)
-                            child.connection.execute("INSERT INTO " + table + " (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")", tuple(row.values()))
-                    child.connection.executemany("INSERT INTO checkpoints(key,payload) VALUES (?,?)",
-                        [(r["key"], r["payload"]) for r in exports])
-                    runtime = snapshot["runtime"][0]
-                    child.connection.execute("UPDATE runtime SET manifest=?,version=?,state=?,progress=?,group_state=? WHERE singleton=1",
-                        (json.dumps(manifest, ensure_ascii=False), runtime["version"], runtime["state"], runtime["progress"], runtime["group_state"]))
-                    for row in source.connection.execute("SELECT * FROM calls"):
-                        columns = list(row.keys())
-                        child.connection.execute("INSERT INTO calls (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")", tuple(row))
-                child.manifest = manifest
-                child.publish_world()
-                child.publish_characters()
+                    manifest["resume_after_version"] = snapshot["runtime"][0]["version"]
+                source._copy_prefix(child, snapshot, manifest, preserve_progress=preserve_progress)
                 return child.status()
-            finally:
-                child.close()
+
+    @classmethod
+    def fork_node(cls, directory, destination, node_id, *, seed, max_timelines=1, opportunity=None, max_calls=None, max_tokens=None):
+        """从节点首组的已保存入口派生；父库可由编排者持锁，本方法只读同一 SQLite 快照。"""
+        with cls(directory, readonly=True) as source:
+            config_data = {**source.config.model_dump(), "run_directory": Path(destination), "seed": seed,
+                           "branch_plan": None, "max_timelines": max_timelines, "stop_after_group": None}
+            if max_calls is not None:
+                config_data["max_calls"] = max_calls
+            if max_tokens is not None:
+                config_data["max_tokens"] = max_tokens
+            config = type(source.config).model_validate(config_data)
+            for name in ("max_calls", "max_tokens"):
+                parent_limit = getattr(source.config, name)
+                if parent_limit is not None and getattr(config, name) > parent_limit:
+                    raise ValueError("子分支预算不能超出父运行上限")
+            return source._fork_from_checkpoint(node_id, config, opportunity=opportunity)
+
+    @classmethod
+    def fork_experiment(cls, directory, config, *, node_id):
+        """采用独立配置开一棵新实验树，其共同前缀来自来源运行的已保存节点入口。"""
+        with cls(directory, readonly=True) as source:
+            config = type(source.config).model_validate(config)
+            if config.repository.expanduser().resolve() != source.config.repository:
+                raise ValueError("新实验必须使用来源运行的同一 repository")
+            destination = config.run_directory.expanduser().resolve()
+            if destination.is_relative_to(source.directory) or source.directory.is_relative_to(destination):
+                raise ValueError("新实验目录与来源运行必须相互独立，不能嵌套")
+            return source._fork_from_checkpoint(node_id, config, new_tree=True)
+
+    def _fork_from_checkpoint(self, node_id, config, *, new_tree=False, opportunity=None):
+        destination = config.run_directory.expanduser()
+        if destination.is_symlink():
+            raise ValueError("不能通过符号链接写分支目标")
+        destination = destination.resolve()
+        config = config.model_copy(update={"run_directory": destination, "repository": self.config.repository})
+        if self.manifest["format"] != self.FORMAT or self.config.run_directory.resolve() != self.directory:
+            raise ValueError("只能从原目录中当前格式的运行创建分支")
+        nodes = {n["node_id"]: n for n in self.manifest["nodes"]}
+        if node_id not in nodes:
+            raise ValueError("分叉时间节点不存在：" + node_id)
+        node = nodes[node_id]
+        birth = self.manifest.get("fork_node_id") or self.manifest.get("source_node_id")
+        if birth is not None and node["order"] < nodes[birth]["order"]:
+            raise ValueError("不能从当前分支出生前的节点派生")
+        first = node["groups"][0]["group_id"]
+        snapshot = self.get_checkpoint("group_start/" + first)
+        if not snapshot or not {"last_call_id", "last_draft_rowid"} <= snapshot.keys():
+            raise ValueError("缺少带前缀费用边界的节点首组检查点：" + node_id)
+        runtime = snapshot["runtime"][0]
+        progress = json.loads(runtime["progress"])
+        if (progress["node_id"], progress["group_order"], progress["stage"]) != (node_id, 1, "group_ready"):
+            raise ValueError("检查点不是指定节点的首组入口")
+        config.validate_branching()
+        if new_tree:
+            lineage = {"parent_run_id": self.run_id, "source_directory": str(self.directory), "source_node_id": node_id,
+                       "source_group_id": first, "source_version": runtime["version"], "source_call_id": snapshot["last_call_id"]}
+        else:
+            lineage = {"branch_root_id": self.manifest.get("branch_root_id", self.run_id),
+                       "parent_run_id": self.run_id, "fork_node_id": node_id, "fork_group_id": first,
+                       "fork_version": runtime["version"], "fork_call_id": snapshot["last_call_id"]}
+
+        if opportunity is not None:
+            split = self.get_checkpoint("branch_split")
+            if (not split or split["node_id"] != node_id or opportunity not in split["alternatives"]
+                    or opportunity["name"] != destination.name):
+                raise ValueError("探索方向与世界在当前分叉点提交的决策不一致")
+            lineage["branch_opportunity"] = opportunity
+
+        def existing_child():
+            with type(self)(destination, readonly=True) as existing:
+                if (existing.config != config or existing.manifest["repository_hash"] != self.manifest["repository_hash"]
+                        or (new_tree and existing.manifest.get("branch_root_id") != existing.run_id)
+                        or any(existing.manifest.get(k) != v for k, v in lineage.items())):
+                    raise ValueError("目标已存在且不属于同一分叉或配置：" + str(destination))
+                return existing.status()
+
+        if destination.exists():
+            return existing_child()
+        # 在暂存和建父目录前检查目标不能写入输入 repository。
+        if config.repository.is_dir() and destination.is_relative_to(config.repository):
+            raise ValueError("分支目录不能放在输入 repository 内")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".node-fork-", dir=destination.parent) as temp:
+            staged = Path(temp) / "run"
+            with type(self).create(config.model_copy(update={"run_directory": staged})) as child:
+                if child.manifest["repository_hash"] != self.manifest["repository_hash"]:
+                    raise ValueError("输入 repository 已变化，不能派生分支")
+                manifest = {**child.manifest, **lineage, "config": config.model_dump(mode="json")}
+                self._copy_prefix(child, snapshot, manifest, node_fork=True)
+                child._save_group_start(first)
+            try:
+                _publish_fork(staged, destination)
+            except FileExistsError:
+                return existing_child()
+        return existing_child()
+
+    @staticmethod
+    def check_draft_digest(row):
+        if sha256(row["payload"].encode()).hexdigest() != row["digest"]:
+            raise ValueError("正式组草稿在验收冻结后已变化，拒绝读取或派生")
+
+    def _copy_prefix(self, child, snapshot, manifest, *, preserve_progress=False, node_fork=False):
+        pending_at_entry = set(snapshot.get("pending_call_ids", ())) if node_fork else set()
+        if node_fork:
+            calls = self.connection.execute("SELECT * FROM calls WHERE scope='simulation' AND id<=?", (snapshot["last_call_id"],))
+            # 当前人物心理和已提交体验取自快照。父运行的审核签名、按轮感知和访问投影不能给子运行授权。
+            snapshot["checkpoints"] = [row for row in snapshot["checkpoints"]
+                                       if not row["key"].startswith(("visibility/", "semantic_", "access/", "selection/", "branch_"))
+                                       and row["key"] not in {"round_schedule", "round_context", "round_perception", "round_access"}]
+            draft_rows = self.connection.execute("SELECT * FROM drafts WHERE rowid<=?", (snapshot["last_draft_rowid"],))
+        else:
+            # 隔离重演仍承担失败尝试的全部账单。
+            calls = self.connection.execute("SELECT * FROM calls WHERE scope NOT LIKE 'selection/%'")
+            draft_rows = self.connection.execute("SELECT * FROM drafts")
+        prefix_version = snapshot["runtime"][0]["version"]
+        snapshot["actions"] = [dict(row) for row in self.connection.execute(
+            "SELECT * FROM actions WHERE status='committed' AND version<=? ORDER BY version", (prefix_version,))]
+        completed = {row["event_id"] for row in snapshot["event_progress"] if row["status"] == "completed"}
+        completed_groups = {g["group_id"] for n in manifest["nodes"] for g in n["groups"] if completed.issuperset(g["events"])}
+        snapshot["drafts"] = [dict(row) for row in draft_rows if row["group_id"] in completed_groups]
+        if preserve_progress:
+            # 个人当前感知还原为已提交批次的反馈，未提交轮次重新感知并审核。
+            views = {}
+            for row in snapshot["actions"]:
+                action = json.loads(row["payload"])
+                views.update((action.get("advance") or {}).get("final_views", {}))
+            snapshot["checkpoints"] = [row for row in snapshot["checkpoints"] if row["key"] != "views"]
+            snapshot["checkpoints"].append({"key": "views", "payload": json.dumps(views, ensure_ascii=False)})
+        exports = [dict(row) for row in child.connection.execute("SELECT * FROM checkpoints WHERE key LIKE 'export/%'")]
+        with child.connection:
+            for table in ("actions", "event_progress", "checkpoints", "drafts"):
+                child.connection.execute("DELETE FROM " + table)
+                for row in snapshot[table]:
+                    if table == "event_progress" and row["outcome"]:
+                        outcome = json.loads(row["outcome"])
+                        outcome["run_id"] = child.run_id
+                        row = {**row, "outcome": json.dumps(outcome, ensure_ascii=False)}
+                    if table == "drafts":
+                        self.check_draft_digest(row)
+                    if table in ("actions", "drafts"):
+                        raw = json.loads(row["payload"])
+                        raw["run_id"] = child.run_id
+                        memories = raw.get("memories", []) + (raw.get("advance") or {}).get("memories", [])
+                        for memory in memories:
+                            memory["run_id"] = child.run_id
+                        row = {**row, "payload": json.dumps(raw, ensure_ascii=False)}
+                    if table == "drafts":
+                        row["digest"] = sha256(row["payload"].encode()).hexdigest()
+                    columns = list(row)
+                    child.connection.execute("INSERT INTO " + table + " (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")", tuple(row.values()))
+            child.connection.executemany("INSERT INTO checkpoints(key,payload) VALUES (?,?)",
+                [(r["key"], r["payload"]) for r in exports])
+            runtime = snapshot["runtime"][0]
+            child.connection.execute("UPDATE runtime SET manifest=?,version=?,state=?,progress=?,group_state=? WHERE singleton=1",
+                (json.dumps(manifest, ensure_ascii=False), runtime["version"], runtime["state"], runtime["progress"], runtime["group_state"]))
+            for row in calls:
+                values = dict(row)
+                if row["id"] in pending_at_entry:
+                    # 父运行可能在入口之后才收到该旧请求的回执；只继承当时已知账目。
+                    values.update(ended=None, status=None, response=None, error=None, usage=None)
+                columns = list(values)
+                child.connection.execute("INSERT INTO calls (" + ",".join(columns) + ") VALUES ("
+                                         + ",".join("?" for _ in columns) + ")", tuple(values.values()))
+        if node_fork:
+            inherited = child.usage("simulation")
+            manifest.update(inherited_calls=inherited["calls"], inherited_tokens=inherited["tokens"])
+            with child.connection:
+                child.connection.execute("UPDATE runtime SET manifest=? WHERE singleton=1",
+                                         (json.dumps(manifest, ensure_ascii=False),))
+        child.manifest = manifest
+        child.publish_world()
+        child.publish_characters()
+
+    def call_count(self, scope):
+        return self.connection.execute("SELECT COUNT(*) FROM calls WHERE scope=?", (scope,)).fetchone()[0]
 
     def usage(self, scope=None):
         where, values = (" WHERE scope=?", (scope,)) if scope else ("", ())
-        rows = self.connection.execute("SELECT * FROM calls" + where, values).fetchall()
-        total, unreported, roles = 0, 0, {}
+        role_column = "role"
+        if self.manifest["format"] != self.FORMAT and not any(
+                r["name"] == "role" for r in self.connection.execute("PRAGMA table_info(calls)")):
+            role_column = "'legacy' AS role"
+        # 长运行的账本含大量请求与原始响应；预算统计只读取计量列。
+        rows = self.connection.execute(f"SELECT started,ended,status,usage,{role_column} FROM calls" + where, values)
+        count, total, unreported, roles = 0, 0, 0, {}
         for row in rows:
+            count += 1
             usage = json.loads(row["usage"] or "{}")
             tokens = usage.get("total_tokens")
             if tokens is None and usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
@@ -362,22 +538,27 @@ class NovelRestoreRuntime:
                 unreported += 1
             tokens = tokens or 0
             total += tokens
-            role = row["role"] if "role" in row.keys() else "legacy"
+            role = row["role"]
             item = roles.setdefault(role, {"calls": 0, "tokens": 0, "seconds": 0.0})
             item["calls"] += 1
             item["tokens"] += tokens
             if row["ended"]:
                 item["seconds"] += max(0, (datetime.fromisoformat(row["ended"]) - datetime.fromisoformat(row["started"])).total_seconds())
-        return {"calls": len(rows), "tokens": total, "unreported_usage_calls": unreported, "roles": roles}
+        return {"calls": count, "tokens": total, "unreported_usage_calls": unreported, "roles": roles}
 
-    def check_budget(self, config, scope):
-        usage = self.usage(scope)
-        if config.max_tokens is not None and usage["unreported_usage_calls"]:
-            raise RunStopped("存在未返回 Token 用量的请求，无法继续保证累计 Token 预算")
-        if config.max_tokens is not None and usage["tokens"] >= config.max_tokens:
-            raise RunStopped("累计 Token 预算已用尽")
-        start = self.connection.execute("SELECT MIN(started) FROM calls WHERE scope=?", (scope,)).fetchone()[0]
-        if config.max_elapsed_seconds is not None and start:
+    def check_budget(self, config, scope, prior_usage=None):
+        prior_usage = prior_usage or {}
+        if config.max_tokens is not None:
+            usage = self.usage(scope)
+            if usage["unreported_usage_calls"] or prior_usage.get("unreported_usage_calls"):
+                raise RunStopped("存在未返回 Token 用量的请求，无法继续保证累计 Token 预算")
+            if usage["tokens"] + prior_usage.get("tokens", 0) >= config.max_tokens:
+                raise RunStopped("累计 Token 预算已用尽")
+        if config.max_elapsed_seconds is not None:
+            start = prior_usage.get("started") or self.connection.execute(
+                "SELECT MIN(started) FROM calls WHERE scope=?", (scope,)).fetchone()[0]
+            if not start:
+                return
             elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(start)).total_seconds()
             if elapsed >= config.max_elapsed_seconds:
                 raise RunStopped("累计运行时间上限已用尽")

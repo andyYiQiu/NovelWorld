@@ -2,25 +2,25 @@
 import asyncio
 from pathlib import Path
 
+from common.NovelRestoreConfig import BranchDecision
+
 from agents.NovelRestoreAgent import task_id
 from agents.NovelRestoreCharacterAgent import NovelRestoreCharacterAgent
 from common.Runtime import JobFailed, RunStopped
-from storage.NovelRestoreStorage import encode
 from common.NovelRestoreSchema import (
-    ConfirmedAction, EventDraft, MemoryRecord,
-    NarrativeAssignment, NarrativeReview, GroupAssessment, MemoryApproval, WaveResolution,
-    StoryPosition, RoundSchedule, StatePatch, NarrativeBatchReview,
+    ConfirmedAction, MemoryRecord, RecallExperience,
+    GroupAssessment, MemoryApproval, WaveResolution,
+    StoryPosition, RoundSchedule, ReplanSchedule, StatePatch,
     PerceptionBatch, WorldPerception, WaveAssessment, WorldAdvance,
     UnknownTargetReview,
 )
 from contract.NovelWorldState import merge_deltas
 from common.NovelRestoreWorldState import apply_patch, resolve_pointer, validate_references, validate_result_evidence
-from common.NovelRestoreStory import story_text
 from common.NovelRestoreObjects import object_assets, object_inventory, validate_registrations, effective_catalog
 from common.NovelRestoreExperience import prepare_experience, advance_needs
-from common.NovelRestoreVisibility import visible_task, private_perceptions, CharacterFeedback
+from common.NovelRestoreVisibility import visible_task, private_perceptions, CharacterFeedback, record_visible
 from common.NovelRestoreContext import (
-    REFERENCE_STATE_POLICY, action_history, interaction_progress, compact_next_reference, repository_reference, simulation_source, link_components,
+    REFERENCE_STATE_POLICY, action_history, interaction_progress, pending_observations, compact_next_reference,
 )
 
 
@@ -45,73 +45,6 @@ class NovelRestoreWorldAgent:
             return None
         from common.NovelRestoreSchema import EventGroup
         return self.repository.group_states(EventGroup.model_validate(groups[index + 1]))[0].model_dump(mode="json")
-
-    async def assign_narration(self, source, requirements, version=None):
-        return await self.executor.run_task("world/assign_narration", "world", self.prompt,
-                                            {"operation": "assign_narration", "repository": self.world,
-                                             "source": simulation_source(source, source["actions"]),
-                                             "requirements": requirements, "version": version}, NarrativeAssignment)
-
-    async def review_batch(self, identity, revision, context, batch):
-        targets = set(context["targets"])
-        direct = {i for i, row in context["links"].items()
-                  if {row["link"]["from_fragment"], row["link"]["to_fragment"]}.intersection(targets)}
-        def validate(result):
-            if any(set(issue.fragment_ids) - targets for issue in result.issues):
-                raise ValueError("本批拒收问题须定位本批加工片段；后续影响使用 affected_fragment_ids")
-            if set(result.preserved_link_ids) - direct:
-                raise ValueError("只能保留本批目标的直接关联，不能顺带确认链上其他关系")
-            if set(result.affected_fragment_ids) - (set(context["reading_order"]) - targets):
-                raise ValueError("影响传播引用未知片段或当前目标")
-        return await self.executor.run_task(identity + "/review/" + str(revision), "world", self.prompt,
-            {"operation": "review_batch", "context": context, "batch": batch.model_dump(mode="json")},
-            NarrativeBatchReview, validate)
-
-    async def review_narrative(self, source, state):
-        def validate(review):
-            if any(set(issue.fragment_ids) - set(state["prose"]) for issue in review.issues):
-                raise ValueError("核对问题必须定位到当前版本的实际片段")
-        base = {"operation": "review_narrative", "requirements": state["config"]["requirements"],
-                "assignment": state["assignment"], "version": state["config"]["version"],
-                "plan": {key: value for key, value in state["plan"].items() if key != "links"},
-                "links": state["links"], "prose_meta": state["prose_meta"]}
-        job = "world/review_narrative/" + str(len(state["reviews"]) + 1)
-        limit = state["config"]["context_chars"]
-        async def check(key, context):
-            if len(encode(context)) > limit:
-                raise RunStopped("内容复核必要资料超出上下文预算；未截断或跳过核对")
-            return await self.executor.run_task(key, "world", self.prompt, context, NarrativeReview, validate)
-        full = {**base, "source": source, "repository": repository_reference(self.world), "prose": state["prose"]}
-        if len(encode(full)) <= limit:
-            return await check(job, full)
-        # 长篇逐章审读；跨章的多段关联另读整链正文，摘要不能代替整链核对。
-        async def check_part(key, scope, ids, chapter=None):
-            fragments = [f for f in state["plan"]["fragments"] if f["fragment_id"] in ids]
-            events = {f["event_id"] for f in fragments}
-            return await check(key, {
-                **base, "scope": scope, "chapter": chapter,
-                "plan": {"chapters": [c for c in state["plan"]["chapters"] if ids.intersection(c["fragment_ids"])],
-                         "fragments": fragments},
-                "prose_meta": {i: value for i, value in state["prose_meta"].items() if i in ids},
-                "prose": {i: value for i, value in state["prose"].items() if i in ids},
-                "links": {i: row for i, row in state["links"].items()
-                          if {row["link"]["from_fragment"], row["link"]["to_fragment"]}.intersection(ids)},
-                "repository": repository_reference(self.world, events),
-                "source": simulation_source(source, events)})
-        checks = []
-        chapters = [set(c["fragment_ids"]) for c in state["plan"]["chapters"]]
-        for chapter, ids in zip(state["plan"]["chapters"], chapters):
-            checks.append(await check_part(job + "/chapter/" + task_id(chapter["chapter_id"]), "chapter", ids, chapter))
-        for index, ids in enumerate(link_components(state["links"]), 1):
-            # 单条关系已联合核对，同章完整链已在上一步读取，不重复调用。
-            if len(ids) > 2 and not any(ids <= chapter for chapter in chapters):
-                checks.append(await check_part(job + "/chain/" + str(index), "link_chain", ids))
-        checks.append(await check(job + "/overview", {**base, "scope": "whole_book_summary",
-            "repository": repository_reference(self.world),
-            "source": [{k: d[k] for k in ("draft_id", "event_id", "achieved_results")} for d in source["drafts"]],
-            "section_reviews": [r.model_dump(mode="json") for r in checks]}))
-        issues = list({encode(i.model_dump()): i for r in checks for i in r.issues}.values())
-        return NarrativeReview(approved=all(r.approved for r in checks), summary="逐章、跨章关联链正文及全书摘要核对", issues=issues)
 
     async def initialize(self):
         self.storage.initialize_world()
@@ -223,6 +156,52 @@ class NovelRestoreWorldAgent:
             raise ValueError(f"scene_anchor 须指向一项已知的具体事实：{anchor}")
         return value
 
+    async def consider_branch(self, group):
+        key = task_id("branch_decision", group.node_id)
+        saved = self.storage.get_checkpoint(key)
+        if saved:
+            return bool(saved["alternatives"])
+        # 决策只展开已成立的现场与最近经过。每个候选须给出可回指此输入的依据。
+        _, state, _ = self.storage.current()
+        evidence = {f"state/{section}/{identity}": value for section, items in
+                    state.model_dump(mode="json").items() if isinstance(items, dict)
+                    for identity, value in items.items()}
+        rows = self.storage.connection.execute("""SELECT payload FROM actions WHERE status='committed'
+                                                  ORDER BY version DESC LIMIT 12""")
+        for row in rows:
+            action = ConfirmedAction.model_validate_json(row[0])
+            evidence[action.action_id] = action.result
+        context = {"operation": "consider_branch", "node_id": group.node_id,
+                   "capacity": self.storage.config.max_timelines, "evidence": evidence,
+                   "story_seconds": self.storage.get_checkpoint("story_seconds", 0)}
+
+        def validate(decision):
+            choices = decision.alternatives
+            if len(choices) == 1 or len(choices) > context["capacity"]:
+                raise ValueError("继续时 alternatives 留空；分叉至少两个走法且不超过剩余容量")
+            intents = {choice.opportunity.strip() for choice in choices}
+            if len(intents) != len(choices) or "" in intents:
+                raise ValueError("每条线须有不同的具体探索机会")
+            if any(set(choice.source_ids) - evidence.keys() for choice in choices):
+                raise ValueError("分支机会必须引用本节点实际现场的依据")
+
+        decision = await self.executor.run_task(task_id("world", "consider_branch", group.node_id), "world",
+            self.prompt, context, BranchDecision, validate)
+        saved = {"node_id": group.node_id, **decision.model_dump(mode="json")}
+        # 目录标识也被用作择线编号，不允许其中包含尚未发生的故事设想。
+        for index, choice in enumerate(saved["alternatives"], 1):
+            choice["name"] = str(index)
+        with self.storage.connection:
+            self.storage._put("checkpoints", key, saved)
+            if decision.alternatives:
+                self.storage._put("checkpoints", "branch_split", saved)
+                # 节点决策在首次行动前完成。其账目也属于子线共同承担的前缀。
+                start_key = "group_start/" + group.group_id
+                entry = self.storage.get_checkpoint(start_key)
+                entry["last_call_id"] = self.storage.connection.execute("SELECT coalesce(max(id),0) FROM calls").fetchone()[0]
+                self.storage._put("checkpoints", start_key, entry)
+        return bool(decision.alternatives)
+
     async def schedule(self, group, clock):
         states = self.storage.event_states()
         current_people = self.storage.current()[1].characters
@@ -233,6 +212,8 @@ class NovelRestoreWorldAgent:
         last_goal = self.storage.get_checkpoint("last_goal")
         completed = self.storage.get_checkpoint("core_completed", {})
         runtime = self.runtime_context(group)
+        interactions = interaction_progress(runtime["actions"], eligible, group=(group.node_id, group.order))
+        replan = clock["stagnant"] >= self.storage.config.stagnation_rounds
         def validate(result):
             if set(result.actors) != set(eligible):
                 raise ValueError("actors 必须以当前活跃事件编号为键，值只能是该事件的参与人物编号或 null；"
@@ -258,26 +239,100 @@ class NovelRestoreWorldAgent:
                     raise ValueError("客观状态中已死亡或尚未出生的人物不能主动行动")
                 if result.actors[event] and not self.storage.get_checkpoint("person_runtime", {}).get(result.actors[event], {}).get("can_act", True):
                     raise ValueError("当前无法自主行动的人物不能被安排主动行为")
-        return await self.executor.run_task(task_id("world", "schedule", group.group_id, clock["round"]),
-            "world", self.prompt, {"operation": "schedule", "eligible": eligible, "clock": clock,
-                "replan": clock["stagnant"] >= self.storage.config.stagnation_rounds,
+        job = task_id("world", "schedule", group.group_id, clock["round"])
+        context = {"operation": "schedule", "eligible": eligible, "clock": clock, "replan": replan,
                 "group": group.model_dump(mode="json"), "target_state": target,
                 "next_reference": compact_next_reference(target, self.continuation(group)),
                 "last_goal": ({k: last_goal[k] for k in ("achieved", "continuity_ok")} if last_goal else None),
                 "assessment_feedback": ({k: last_goal.get(k, []) for k in ("remaining", "contradictions")} if last_goal else None),
                 "core_completed": {event: {"achieved": item["achieved"]} for event, item in completed.items()},
-                "interaction_progress": interaction_progress(runtime["actions"], eligible,
-                                                             group=(group.node_id, group.order)),
-                **runtime}, RoundSchedule, validate)
+                "interaction_progress": interactions, **runtime}
+        if group.node_id == self.storage.manifest.get("fork_node_id") and self.storage.manifest.get("branch_opportunity"):
+            context["branch_opportunity"] = self.storage.manifest["branch_opportunity"]
+        if not replan:
+            return await self.executor.run_task(job, "world", self.prompt, context, RoundSchedule, validate)
+
+        previous = self.storage.get_checkpoint("round_schedule") or {}
+        prior_focus = {}
+        if previous.get("group_id") == group.group_id and previous.get("scene_decisions"):
+            context["previous_scene_decisions"] = previous["scene_decisions"]
+            prior_focus = {e: {"actor": previous["actors"][e], "pacing": d["pacing"],
+                               "after_action_id": d["after_action_id"],
+                               "anchor": (previous["arrangements"].get(e) or {}).get("scene_anchor") or
+                                         d.get("focus_anchor") or d["after_action_id"]}
+                           for e, d in previous["scene_decisions"].items() if e in eligible}
+
+        def validate_replan(result):
+            validate(result)
+            if set(result.scene_decisions) != set(eligible):
+                raise ValueError("scene_decisions 须恰好覆盖本轮所有活跃事件")
+            for event, decision in result.scene_decisions.items():
+                recent = interactions[event]["recent_actions"]
+                last_id = recent[-1]["action_id"] if recent else None
+                if decision.after_action_id != last_id:
+                    raise ValueError(f"{event} 的重规划须从该事件最后一次已提交行动 {last_id} 起比较")
+                if event in result.arrangements:
+                    if decision.focus_anchor not in (None, result.arrangements[event].scene_anchor):
+                        raise ValueError(f"{event} 的环境机会须沿用该环境安排的现场依据")
+                else:
+                    self.scene_evidence(decision.focus_anchor or last_id, runtime)
+
+        def scene_for_review(candidate):
+            # 审读者只核对当前现场能否支持这一步。调度者的目标、缺口与查档结果不传入。
+            return {"eligible": eligible, "interaction_progress": interactions,
+                    "previous_scheduled_focus": prior_focus,
+                    "pending_observations": pending_observations(runtime["actions"], interactions),
+                    "current_state": runtime["current_state"], "views": runtime["views"],
+                    "person_runtime": runtime["person_runtime"], "story_seconds": runtime["story_seconds"],
+                    "working_states": {p: s["current"]["working_state"] for p, s in runtime["subjective_worlds"].items()},
+                    "initial_location_assets": {p: self.world["assets"]["location"][choice.location_id]
+                                                for p, choice in candidate.initial_locations.items()},
+                    "scene_focus": self.scene_focus(candidate.model_dump(mode="json"), runtime, eligible),
+                    "scene_evidence": {event: self.scene_evidence(attempt.scene_anchor, runtime)
+                                       for event, attempt in candidate.arrangements.items()}}
+
+        def review_paths(candidate):
+            # 逐事件、逐人覆盖，避免审了第一个事件就放行同批其他安排。
+            return [f"/{field}/" + key.replace("~", "~0").replace("/", "~1")
+                    for field in ("scene_decisions", "actors", "arrangements", "initial_locations")
+                    for key in getattr(candidate, field)]
+
+        result, review_job = await reviewed_task(self.executor, job, self.prompt, context, ReplanSchedule,
+            validate_replan, review_paths, review_evidence=scene_for_review)
+        seal_review(self.storage, "schedule", result.model_dump(mode="json"), review_job)
+        return result
+
+    def scene_focus(self, plan, runtime, event_ids):
+        """仅投影本批事件的取景方式和可回读的现场事实。"""
+        focus = {}
+        for event in event_ids:
+            decision = plan.get("scene_decisions", {}).get(event)
+            if decision is None:
+                continue
+            attempt = plan.get("arrangements", {}).get(event)
+            anchor = attempt["scene_anchor"] if attempt else decision.get("focus_anchor") or decision["after_action_id"]
+            if anchor:
+                focus[event] = {"pacing": decision["pacing"], "anchor": anchor,
+                                "fact": self.scene_evidence(anchor, runtime)}
+        return focus
+
+    def _current_schedule(self, group, round_number):
+        plan = self.storage.get_checkpoint("round_schedule") or {}
+        if plan.get("group_id") == group.group_id and plan.get("round") == round_number:
+            return plan
+        return {}
 
     async def perceive(self, group, people, clock):
+        runtime = self.runtime_context(group)
+        plan = self._current_schedule(group, clock["round"])
+        focus = self.scene_focus(plan, runtime, [event for event, actor in plan.get("actors", {}).items() if actor in people])
         def validate(result):
             if set(result.views) != set(people):
                 raise ValueError("行动前感知须恰好覆盖本批选中的人物")
             self.storage.validate_views(result.views)
         result = await visible_task(self.executor, task_id("world", "perceive", group.group_id, clock["round"]),
             self.prompt, {"operation": "perceive", "selected": people,
-                **self.runtime_context(group)}, PerceptionBatch, validate,
+                **runtime, **({"scene_focus": focus} if focus else {})}, PerceptionBatch, validate,
             lambda value: {p: {"perception": v.personal.model_dump()} for p, v in value.views.items()},
             fixed=private_perceptions, private_review=private_perceptions)
         return result.views
@@ -365,14 +420,26 @@ class NovelRestoreWorldAgent:
         # 从实存状态回读供裁定及独立审核共同核对；环境安排自己的说明不充当证据。
         anchors = {row["action_id"]: self.scene_evidence(row["arrangement"]["scene_anchor"], runtime)
                    for row in wave if (row.get("arrangement") or {}).get("scene_anchor")}
+        plan = self._current_schedule(group, wave[0]["position"]["round"])
+        event_ids = [row["position"]["event_id"] for row in wave]
+        focus = self.scene_focus(plan, runtime, event_ids)
+        decisions = plan.get("scene_decisions", {})
+        boundaries = {event: decisions[event]["stop_before"] for event in event_ids if event in decisions}
+        def review_resolution(value):
+            evidence = private_perceptions(value)
+            if boundaries:
+                evidence["approved_boundaries"] = boundaries
+            return evidence
+
         result = await visible_task(self.executor, task_id("world", "wave", wave_id), self.prompt,
             {"operation": "resolve_wave", **runtime,
              **({"scene_evidence": anchors} if anchors else {}),
+             **({"scene_focus": focus} if focus else {}),
              "state_consistency_feedback": (self.storage.get_checkpoint("last_goal") or {}).get("contradictions", []),
              "object_inventory": object_inventory(self.storage),
              "intents": [{**row, "proposal": p.model_dump(mode="json")} for row, p in zip(wave, proposals)],
              "current_version": version}, WaveResolution, validate, project,
-            fixed=private_perceptions, private_review=private_perceptions,
+            fixed=private_perceptions, private_review=review_resolution,
             observer_evidence=lambda value: {p: self.storage.subjective_world(p) for p in final_views(value)
                                              if p not in runtime["subjective_worlds"]})
         result.actions.sort(key=lambda action: list(rows).index(action.action_id))
@@ -411,7 +478,8 @@ class NovelRestoreWorldAgent:
                 runtime["subjective_worlds"][person] = self.storage.subjective_world(person)
         access = await prepare_experience(self, wave_id + "/after", people, observations=observations,
                                           runtimes=runtimes, states=states,
-                                          elapsed_seconds=result.advance.elapsed_seconds) if people else {}
+                                          elapsed_seconds=result.advance.elapsed_seconds,
+                                          acted=[p.character_id for p in proposals if p.character_id]) if people else {}
         for revision in range(self.storage.config.semantic_repairs + 1):
             summaries = await asyncio.gather(*(NovelRestoreCharacterAgent(person, self.storage, self.executor).summarize_wave(
                 wave_id, access[person], revision, feedback.get(person, []),
@@ -442,6 +510,13 @@ class NovelRestoreWorldAgent:
                     lambda value: {p: {"feedback": messages} for p, messages in value.messages.items()},
                     initial=CharacterFeedback(messages=feedback))
                 feedback = safe.messages
+                # 有提取失真时，审核者知道人物不该知道的原始身份。人物返修仅收固定提示。
+                for person in people:
+                    effects = [*runtime["person_runtime"].get(person, {}).get("effects", []),
+                               *runtimes.get(person, {}).get("effects", [])]
+                    if any(effect["stage"] == "retrieval" for effect in effects):
+                        feedback[person] = ["请仅依据本次获得的体验、当时的回想和可见编号核对自己的记录。"]
+                        record_visible(self.storage, person, {"feedback": feedback[person]}, "recall/private-repair")
         else:
             raise JobFailed("人物主观世界未通过检查：" + "; ".join(approval.issues))
         actions = []
@@ -451,6 +526,7 @@ class NovelRestoreWorldAgent:
             contributions = [m for summary in summaries for m in summary.memories if m.source_action_id == resolved.action_id]
             actions.append(ConfirmedAction(action_id=resolved.action_id, run_id=self.storage.run_id,
                 expected_version=version, position=StoryPosition.model_validate(row["position"]), proposal=proposal,
+                recollections_before=RecallExperience.from_action_context(row["context"]),
                 result=resolved.result, state_patch=resolved.state_patch, resolved_targets=resolved.resolved_targets,
                 unknown_target_review=unknown_review if resolved in unresolved else None,
                 views_before={p: before_views[p] for p in resolved.observations if p in before_views},
@@ -504,27 +580,6 @@ class NovelRestoreWorldAgent:
         self.storage.validate_wave(actions, mental)
         seal_review(self.storage, "wave", wave_delivery(actions, mental, assessment.goal, assessment.made_progress), review_job)
         return actions, mental, assessment.goal, assessment.made_progress
-
-    async def build_draft(self, group, event):
-        identity = event["task_id"]
-        if self.storage.get_draft(identity) is not None:
-            return
-        status = self.storage.event_states()[identity]
-        if status["status"] != "completed":
-            raise ValueError("未达标事件不能生成正式草稿")
-        actions = self.storage.event_actions(identity)
-        materials = [action.story_material() for action in actions]
-        shared = [m for m in self.storage.group_materials(group.group_id) if identity in m.related_event_ids]
-        group_actions = [a for e in group.events for a in self.storage.event_actions(e["task_id"])]
-        results = self.storage.get_checkpoint("core_completed", {})[identity]["achieved_results"]
-        self.storage.save_draft(EventDraft(draft_id=task_id("draft", identity), run_id=self.storage.run_id,
-                                           event_id=identity, node_id=group.node_id, node_order=group.node_order,
-                                           group_order=group.order,
-                                           participant_ids=list(dict.fromkeys(p["role_code"] for p in event["participants"])),
-                                           action_ids=[action.action_id for action in actions],
-                                           materials=materials, shared_material_ids=[m.shared_id for m in shared],
-                                           text=story_text(group_actions, self.storage.manifest["characters"], identity),
-                                           achieved_results=results))
 
     async def summarize_group(self, group):
         for person in self.storage.manifest["catalog"]["role"]:

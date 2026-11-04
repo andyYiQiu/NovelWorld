@@ -25,33 +25,25 @@ class NovelRestoreExporter:
         for node in self.storage.manifest["nodes"]:
             groups = []
             for group in node["groups"]:
+                identity = group["group_id"]
+                directory = "simulation/groups/" + file_identity(identity)
+                draft = self.storage.get_draft(identity)
+                if draft is not None:
+                    documents[directory + "/draft.json"] = {**draft.model_dump(mode="json"), "accepted": True}
+                    documents[directory + "/story.md"] = draft.text + "\n"
                 events = []
-                for identity in group["events"]:
-                    directory = "simulation/" + file_identity(identity)
-                    actions = self.storage.event_actions(identity)
-                    documents[directory + "/actions.jsonl"] = "".join(row.model_dump_json() + "\n" for row in actions)
-                    draft = self.storage.get_draft(identity)
-                    status = states[identity]
-                    if draft is not None:
-                        documents[directory + "/story.md"] = draft.text + "\n"
-                    if draft is not None or actions:
-                        documents[directory + "/draft.json"] = {
-                            **(draft.model_dump(mode="json") if draft else {
-                                "run_id": self.storage.run_id, "event_id": identity, "text": None,
-                                "materials": [a.story_material().model_dump(mode="json") for a in actions]}),
-                            "accepted": draft is not None}
-                    event = {"event_id": identity, "status": status["status"],
-                             "outcome": json.loads(status["outcome"]) if status["outcome"] else None,
-                             "draft": directory + "/draft.json" if draft or actions else None}
+                for event_id in group["events"]:
+                    actions = self.storage.event_actions(event_id)
+                    documents["simulation/events/" + file_identity(event_id) + "/actions.jsonl"] = "".join(
+                        row.model_dump_json() + "\n" for row in actions)
+                    event = {"event_id": event_id, "status": states[event_id]["status"]}
                     events.append(event)
-                    if status["status"] != "completed" or draft is None:
+                    if event["status"] != "completed":
                         unfinished.append(event)
-                assessment = self.storage.group_assessment(group["group_id"])
-                if not assessment or not assessment["achieved"]:
-                    unfinished.append({"group_id": group["group_id"], "reason": "组后世界状态尚未通过验收"})
-                groups.append({"group_id": group["group_id"], "order": group["order"], "events": events,
-                               "shared_materials": [m.model_dump(mode="json") for m in self.storage.group_materials(group["group_id"])],
-                               "assessment": assessment})
+                if draft is None:
+                    unfinished.append({"group_id": identity, "reason": "事件组尚无验收后的正式草稿"})
+                groups.append({"group_id": identity, "order": group["order"], "events": events,
+                               "draft": directory + "/draft.json" if draft else None})
             nodes.append({"node_id": node["node_id"], "order": node["order"], "groups": groups})
         documents["story_timeline.json"] = {"run_id": self.storage.run_id, "time_basis": "story", "nodes": nodes}
         documents["completion.json"] = {"run_id": self.storage.run_id, "progress": self.storage.current()[2],
@@ -66,8 +58,8 @@ class NovelRestoreExporter:
     def story_progress(self):
         """只摘录已提交故事材料；个人体验和记忆不提升为客观事实。"""
         actions = self.storage.event_actions()
-        drafts = sum(self.storage.get_draft(identity) is not None for identity in self.storage.event_states())
-        lines = ["# 已提交故事材料", "", f"已保存 {len(actions)} 次行动；正式事件草稿 {drafts} 份。", "",
+        drafts = self.storage.connection.execute("SELECT count(*) FROM drafts").fetchone()[0]
+        lines = ["# 已提交故事材料", "", f"已保存 {len(actions)} 次行动；正式事件组草稿 {drafts} 份。", "",
                  "这是持续更新的材料预览，不是最终小说；片段已提交不等于事件组已通过验收。"
                  "个人体验与记忆保留其主观归属，同批材料的排列不表示先后。", ""]
         lines.append(story_text(actions, self.storage.manifest["characters"]))

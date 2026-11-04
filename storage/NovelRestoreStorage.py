@@ -13,11 +13,12 @@ from urllib.parse import quote
 from common.NovelRestoreConfig import NovelRestoreConfig, NovelRestoreNarrativeConfig
 from common.NovelRestoreRepository import open_repository
 from common.NovelRestoreSchema import (
-    ConfirmedAction, EventDraft, EventOutcome, NarrativeBatch, NarrativePlan, NarrativeReview, NarrativeSelection,
-    ProseFragment, WorldState, MemoryRecord, MemoryContribution, WorldPerception, RoundSchedule, StatePatch,
+    ConfirmedAction, EventDraft, Format17GroupDraft, GroupDraft, EventOutcome, NarrativeBatch, NarrativePlan, NarrativeReview, NarrativeSelection,
+    ProseFragment, WorldState, MemoryRecord, WorldPerception, RoundSchedule, ReplanSchedule, StatePatch,
     SharedStoryMaterial,
 )
 from common.Runtime import RunStopped
+from common.NovelRestoreReview import require_review
 from common.NovelRestoreWorldState import apply_patch, sync_snapshot, validate_references
 from common.NovelRestoreStory import story_text
 from common.NovelRestoreObjects import effective_catalog
@@ -34,7 +35,7 @@ class NarrativeLimitReached(RunStopped):
 
 
 class NovelRestoreStorage(NovelRestoreRuntime):
-    FORMAT = 16
+    FORMAT = 18
 
     @classmethod
     def create(cls, config: NovelRestoreConfig):
@@ -62,13 +63,15 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                     before, after = repository.group_states(group)
                     validate_references(before, catalog)
                     validate_references(after, catalog)
-                    groups.append({"group_id": group.group_id, "order": group.order, "events": events})
+                    groups.append({"group_id": group.group_id, "order": group.order, "events": events, "event_ids": list(events)})
                 nodes.append({"node_id": node["node_id"], "order": node["order"], "groups": groups})
                 previous = node["node_id"]
+            config.validate_branching()
             if config.stop_after_group and not any(
                     group["group_id"] == config.stop_after_group for node in nodes for group in node["groups"]):
                 raise ValueError("停止事件组不存在：" + config.stop_after_group)
-            manifest = {"format": cls.FORMAT, "run_id": uuid4().hex, "source": repository.source,
+            run_id = uuid4().hex
+            manifest = {"format": cls.FORMAT, "run_id": run_id, "branch_root_id": run_id, "source": repository.source,
                         "config": config.model_dump(mode="json"), "repository_hash": repository.fingerprint(),
                         "catalog": catalog, "characters": repository.assets("role"), "nodes": nodes}
             state = sync_snapshot(None, repository.snapshot(nodes[0]["node_id"]))
@@ -94,7 +97,7 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                     outcome TEXT, outcome_version INTEGER)""")
                 connection.execute("CREATE TABLE checkpoints (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
                 connection.execute("CREATE TABLE jobs (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
-                connection.execute("CREATE TABLE drafts (event_id TEXT PRIMARY KEY, draft_id TEXT UNIQUE NOT NULL, payload TEXT NOT NULL)")
+                connection.execute("CREATE TABLE drafts (group_id TEXT PRIMARY KEY, draft_id TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, digest TEXT NOT NULL)")
                 connection.execute("CREATE TABLE narratives (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
                 connection.execute("""CREATE TABLE narrative_batches (
                     version_id TEXT NOT NULL, task_id TEXT NOT NULL, payload TEXT NOT NULL,
@@ -127,7 +130,7 @@ class NovelRestoreStorage(NovelRestoreRuntime):
             raise
         return storage
 
-    def __init__(self, directory, *, readonly=False):
+    def __init__(self, directory, *, readonly=False, narration_only=False):
         self.directory = Path(directory).expanduser().resolve()
         self.readonly = readonly
         self.connection = None
@@ -157,13 +160,16 @@ class NovelRestoreStorage(NovelRestoreRuntime):
             self.manifest = json.loads(row[0])
             if self.manifest["format"] != self.FORMAT and not (readonly and self.manifest["format"] in range(1, self.FORMAT)):
                 raise ValueError("旧运行格式仅支持只读查看；请新建运行，不原地升级")
-            self.config = NovelRestoreConfig.model_validate(self.manifest["config"])
+            saved_config = self.manifest["config"]
+            if self.manifest["format"] < 17:
+                saved_config = {"max_timelines": 1, **saved_config}
+            self.config = NovelRestoreConfig.model_validate(saved_config)
             if not readonly and self.config.run_directory.resolve() != self.directory:
                 raise ValueError("运行目录与初始化绑定不一致，不能写入复制的运行")
             self.run_id = self.manifest["run_id"]
             self.memory = NovelRestoreSubjectiveWorld(self.directory / "memories", self.run_id,
                 self.manifest["catalog"]["role"], legacy=self.manifest["format"] < 8)
-            if not readonly:
+            if not readonly and not narration_only:
                 if self.config.repository.is_dir():
                     self._json_repository = open_repository(self.config.repository)
                 with self.read_repository() as repository:
@@ -286,10 +292,15 @@ class NovelRestoreStorage(NovelRestoreRuntime):
     def save_round_schedule(self, group, clock, result):
         """原子保存调度及从未知位置补充的模拟初态；不伪造人物移动。"""
         self._writable()
-        result = RoundSchedule.model_validate(result.model_dump(mode="json"))
         version, state, progress = self.current()
         if (group.node_id, group.order) != (progress["node_id"], progress["group_order"]) or clock != self.get_checkpoint("group_clock"):
             raise ValueError("行动机会或初始地点的依据已过期")
+        payload = result.model_dump(mode="json")
+        if clock["stagnant"] >= self.config.stagnation_rounds:
+            result = ReplanSchedule.model_validate(payload)
+            require_review(self, "schedule", payload)
+        else:
+            result = RoundSchedule.model_validate(payload)
         states = self.event_states()
         people = {p["role_code"] for event in group.events if states[event["task_id"]]["status"] == "running"
                   for p in event["participants"]}
@@ -595,12 +606,14 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         if stage == "simulation_complete":
             for node in self.manifest["nodes"]:
                 self._require_completed(node["node_id"])
+                if any(self.get_draft(group["group_id"]) is None for group in node["groups"]):
+                    raise ValueError("所有事件组均须保存正式草稿后才能完成模拟")
         progress = self.current()[2]
         if stage == "group_complete":
             self._require_completed(progress["node_id"], progress["group_order"])
             node = next(n for n in self.manifest["nodes"] if n["node_id"] == progress["node_id"])
             group = next(g for g in node["groups"] if g["order"] == progress["group_order"])
-            if group["group_id"] != self.config.stop_after_group or any(self.get_draft(e) is None for e in group["events"]):
+            if group["group_id"] != self.config.stop_after_group or self.get_draft(group["group_id"]) is None:
                 raise ValueError("指定停止事件组尚未完成草稿保存")
         progress.update(stage=stage, error=error)
         with self.connection:
@@ -618,63 +631,95 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         row = self.connection.execute("SELECT payload FROM actions WHERE action_id=? AND status='committed'", (action_id,)).fetchone()
         return ConfirmedAction.model_validate_json(row[0]) if row else None
 
-    def get_draft(self, event_id):
-        row = self.connection.execute("SELECT payload FROM drafts WHERE event_id=?", (event_id,)).fetchone()
-        return EventDraft.model_validate_json(row[0]) if row else None
+    def get_draft(self, identity):
+        """当前格式按组读取；旧运行的只读 API 保留原来的事件键。"""
+        if self.manifest["format"] < 17:
+            row = self.connection.execute("SELECT payload FROM drafts WHERE event_id=?", (identity,)).fetchone()
+            return EventDraft.model_validate_json(row[0]) if row else None
+        row = self.connection.execute("SELECT payload,digest FROM drafts WHERE group_id=?", (identity,)).fetchone()
+        if row is None:
+            return None
+        self.check_draft_digest(row)
+        schema = Format17GroupDraft if self.manifest["format"] == 17 else GroupDraft
+        return schema.model_validate_json(row["payload"])
 
-    def group_materials(self, group_id):
-        group = next((g for n in self.manifest["nodes"] for g in n["groups"] if g["group_id"] == group_id), None)
-        if group is None:
-            raise ValueError("未知事件组")
+    def group_actions(self, node_id, order):
+        return [ConfirmedAction.model_validate_json(row[0]) for row in self.connection.execute(
+            """SELECT payload FROM actions WHERE status='committed'
+               AND json_extract(payload,'$.position.node_id')=? AND json_extract(payload,'$.position.group_order')=?
+               ORDER BY version""", (node_id, order))]
+
+    @staticmethod
+    def _shared_materials(group_id, actions):
         result = []
-        for event_id in group["events"]:
-            for action in self.event_actions(event_id):
-                advance = action.advance
-                if not advance or not advance.result or not advance.shared_id:
-                    continue
-                result.append((action.position.turn, action.position.round, SharedStoryMaterial(shared_id=advance.shared_id, group_id=group_id,
+        for action in actions:
+            advance = action.advance
+            if advance and advance.result and advance.shared_id:
+                result.append(SharedStoryMaterial(shared_id=advance.shared_id, group_id=group_id, turn=action.position.turn,
                     result=advance.result, related_event_ids=advance.related_event_ids,
                     experiences={p: view.personal for p, view in advance.observations.items()},
-                    memories=[MemoryContribution.model_validate(m.model_dump(include=set(MemoryContribution.model_fields)))
-                              for m in advance.memories], working_states=advance.working_states)))
-        return [material for _, _, material in sorted(result, key=lambda row: (row[0], row[1]))]
+                    memories=[m.story_memory() for m in advance.memories],
+                    working_states={p: state.story_state() for p, state in advance.working_states.items()}))
+        return result
 
-    def save_draft(self, draft):
+    def group_materials(self, group_id):
+        node, group = self._find_group(group_id)
+        return self._shared_materials(group_id, self.group_actions(node["node_id"], group["order"]))
+
+    def _find_group(self, group_id):
+        for node in self.manifest["nodes"]:
+            for group in node["groups"]:
+                if group["group_id"] == group_id:
+                    return node, group
+        raise ValueError("未知事件组：" + group_id)
+
+    def _group_draft(self, node, group):
+        self._require_completed(node["node_id"], group["order"])
+        group_id = group["group_id"]
+        events = group["event_ids"]
+        actions = self.group_actions(node["node_id"], group["order"])
+        shared = self._shared_materials(group_id, actions)
+        materials = [a.story_material() for a in actions]
+        # 人物表只解释冻结材料中实际行动或获得体验的人物身份，上游预定参与者不能证明到场。
+        people = {}
+        event_actions = {event: [] for event in events}
+        for material in materials:
+            event_actions[material.position.event_id].append(material.action_id)
+            people.update(dict.fromkeys(material.perceptions_before))
+            if material.proposal:
+                people[material.proposal.character_id] = None
+        for item in [*materials, *shared]:
+            people.update(dict.fromkeys(item.experiences))
+            people.update(dict.fromkeys(item.working_states))
+            people.update(dict.fromkeys(m.character_id for m in item.memories))
+        characters = self.manifest["characters"]
+        names = {p: characters[p].get("role_name") or "未命名人物" for p in people}
+        results = self.get_checkpoint("core_completed", {})
+        return GroupDraft(draft_id="draft/" + quote(group_id, safe=""), run_id=self.run_id, group_id=group_id,
+            node_id=node["node_id"], node_order=node["order"], group_order=group["order"], event_ids=events,
+            action_ids=[m.action_id for m in materials], participant_ids=list(people), participant_names=names,
+            event_action_ids=event_actions,
+            batch_elapsed_seconds={a.position.turn: a.advance.elapsed_seconds for a in actions if a.advance},
+            achieved_results={e: results[e]["achieved_results"] for e in events},
+            materials=materials, shared_materials=shared, shared_material_ids=[m.shared_id for m in shared],
+            text=story_text(actions, characters))
+
+    def archive_group(self, group_id):
+        """从已提交故事生成唯一正式版本；重复调用只能得到逐项相同的材料。"""
         self._writable()
-        draft = EventDraft.model_validate(draft.model_dump(mode="json"))
-        materials = [action.story_material() for action in self.event_actions(draft.event_id)]
-        if draft.materials and draft.materials != materials:
-            raise ValueError("草稿故事材料必须来自已提交的实际模拟，不得自行改写")
-        draft.materials = materials
-        old = self.get_draft(draft.event_id)
+        draft = self._group_draft(*self._find_group(group_id))
+        old = self.get_draft(group_id)
         if old is not None:
             if old != draft:
-                raise ValueError("同一事件的正式草稿不能覆盖")
+                raise ValueError("同一事件组的正式草稿不能覆盖")
             return
-        event = self.event_states().get(draft.event_id)
-        node = next((row for row in self.manifest["nodes"] if row["node_id"] == draft.node_id), None)
-        group = next((row for row in node["groups"] if row["order"] == draft.group_order), None) if node else None
-        if group and not (self.group_assessment(group["group_id"]) or {}).get("achieved"):
-            raise ValueError("事件组世界状态验收通过后才能保存正式草稿")
-        if (draft.run_id != self.run_id or not event or event["status"] != "completed" or not group
-                or node["order"] != draft.node_order or draft.event_id not in group["events"]
-                or draft.participant_ids != list(dict.fromkeys(group["events"][draft.event_id]))
-                or draft.action_ids != [row.action_id for row in self.event_actions(draft.event_id)]):
-            raise ValueError("正式草稿必须准确绑定已完成事件及其全部实际行动")
-        shared_ids = [m.shared_id for m in self.group_materials(group["group_id"])
-                      if draft.event_id in m.related_event_ids]
-        if draft.shared_material_ids != shared_ids:
-            raise ValueError("草稿共享材料引用必须与本组已确认的相关性一致")
-        group_actions = [a for event_id in group["events"] for a in self.event_actions(event_id)]
-        if draft.text != story_text(group_actions, self.manifest["characters"], draft.event_id):
-            raise ValueError("草稿文字必须直接呈现全部已提交故事材料，不得二次压缩或改写")
-        results = self.get_checkpoint("core_completed", {}).get(draft.event_id, {}).get("achieved_results", [])
-        if draft.achieved_results != results:
-            raise ValueError("草稿结果索引必须来自已确认的事件验收")
         with self.connection:
-            self.connection.execute("INSERT INTO drafts VALUES (?,?,?)", (draft.event_id, draft.draft_id, draft.model_dump_json()))
+            payload = draft.model_dump_json()
+            self.connection.execute("INSERT INTO drafts VALUES (?,?,?,?)",
+                                    (group_id, draft.draft_id, payload, sha256(payload.encode()).hexdigest()))
 
-    def reserve(self, key, occurrence, body, limit, *, can_send, scope="simulation", budget_config=None):
+    def reserve(self, key, occurrence, body, limit, *, can_send, scope="simulation", budget_config=None,
+                prior_usage=None):
         self._writable()
         # 重演继承费用账本，但请求缓存须隔离；运行身份无需进入人物提示。
         key = sha256(encode([self.run_id, key]).encode()).hexdigest()
@@ -684,8 +729,8 @@ class NovelRestoreStorage(NovelRestoreRuntime):
             return dict(row), True
         if not can_send:
             raise RunStopped("未提供模型密钥，不能发出新请求")
-        self.check_budget(budget_config or self.config, scope)
-        if self.connection.execute("SELECT COUNT(*) FROM calls WHERE scope=?", (scope,)).fetchone()[0] >= limit:
+        self.check_budget(budget_config or self.config, scope, prior_usage)
+        if self.call_count(scope) >= limit:
             raise RunStopped("累计模型调用预算已用尽")
         with self.connection:
             from model.ModelClient import CALL_SCOPE
@@ -711,42 +756,31 @@ class NovelRestoreStorage(NovelRestoreRuntime):
 
     def narrative_source(self):
         """仅使用库中已确认资料，不读取草稿导出文件或原小说。"""
-        if self.current()[2]["stage"] != "simulation_complete":
+        if self.connection.execute("SELECT json_extract(progress,'$.stage') FROM runtime WHERE singleton=1").fetchone()[0] != "simulation_complete":
             raise ValueError("全部模拟完成后才能开始叙述")
-        for node in self.manifest["nodes"]:
-            self._require_completed(node["node_id"])
-        states, drafts, actions, shared = self.event_states(), [], {}, {}
-        simulation_hash = sha256()
+        if self.manifest["format"] < self.FORMAT:
+            raise ValueError("旧运行的草稿未归档当前协议的行动前回想，只能查看历史结果")
+        drafts, actions, shared, characters = [], {}, {}, {}
         for node in self.manifest["nodes"]:
             for group in node["groups"]:
-                materials = self.group_materials(group["group_id"])
-                for material in materials:
-                    shared[material.shared_id] = material.model_dump(mode="json")
-                for identity in group["events"]:
-                    draft = self.get_draft(identity)
-                    confirmed = self.event_actions(identity)
-                    simulation_hash.update(encode([a.model_dump(mode="json") for a in confirmed]).encode())
-                    if (states[identity]["status"] != "completed" or draft is None or draft.run_id != self.run_id
-                            or (draft.node_id, draft.group_order) != (node["node_id"], group["order"])
-                            or draft.action_ids != [action.action_id for action in confirmed]):
-                        raise ValueError("叙述来源须包含全部成功事件及其实际草稿和行动")
-                    # 材料只放入下方索引一次，避免每个叙述上下文重复携带。
-                    drafts.append(draft.model_dump(mode="json", exclude={"materials"}))
-                    if draft.materials != [a.story_material() for a in confirmed]:
-                        raise ValueError("草稿材料与已提交的模拟不一致")
-                    expected_shared = [m.shared_id for m in materials
-                                       if identity in m.related_event_ids]
-                    if draft.shared_material_ids != expected_shared:
-                        raise ValueError("草稿共享材料引用与本组实际变化不一致")
-                    actions[identity] = [m.model_dump(mode="json") for m in draft.materials]
-        if not drafts or len({draft["draft_id"] for draft in drafts}) != len(drafts):
-            raise ValueError("叙述来源草稿必须非空且身份唯一")
-        return {"run_id": self.run_id, "repository_hash": self.manifest["repository_hash"],
-                "simulation_hash": simulation_hash.hexdigest(),
-                "nodes": self.manifest["nodes"], "characters": self.manifest["characters"],
-                "drafts": drafts, "actions": actions, "shared_materials": shared}
+                draft = self.get_draft(group["group_id"])
+                if (draft is None or draft.run_id != self.run_id or draft.node_id != node["node_id"]
+                        or draft.group_id != group["group_id"] or draft.group_order != group["order"]
+                        or draft.node_order != node["order"] or draft.event_ids != group["event_ids"]):
+                    raise ValueError("叙述来源缺失或组草稿与冻结时间轴不一致")
+                drafts.append(draft.model_dump(mode="json", exclude={"materials", "shared_materials"}))
+                characters.update({p: {"role_name": name} for p, name in draft.participant_names.items()})
+                for event in draft.event_ids:
+                    actions[event] = []
+                for material in draft.materials:
+                    actions[material.position.event_id].append(material.model_dump(mode="json"))
+                shared.update({m.shared_id: m.model_dump(mode="json") for m in draft.shared_materials})
+        if not drafts:
+            raise ValueError("叙述来源必须包含已验收的组草稿")
+        return {"run_id": self.run_id, "characters": characters, "drafts": drafts,
+                "actions": actions, "shared_materials": shared}
 
-    def create_narrative(self, config, binding):
+    def create_narrative(self, config, binding, *, selection=None):
         self._writable()
         config = NovelRestoreNarrativeConfig.model_validate(config.model_dump(mode="json"))
         if self.connection.execute("SELECT 1 FROM narratives WHERE key=?", (config.version_id,)).fetchone():
@@ -756,6 +790,8 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                  "stage": "initialized", "error": None, "epoch": 0, "sequence": 1,
                  "assignment": None, "plan": None, "prose": {}, "links": {},
                  "pending": None, "reviews": [], "issues": [], "prose_meta": {}, "batch_reviews": []}
+        if selection is not None:
+            state["selection"] = selection
         with self.connection:
             self._put("narratives", config.version_id, state)
 
@@ -787,8 +823,9 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                 self.run_id, version_id, config["requirements"], 1):
             raise ValueError("叙述计划身份或版本要求不匹配")
         drafts = {row["draft_id"]: row for row in self.check_narrative_source(version_id)["drafts"]}
-        if {fragment.draft_id for fragment in plan.fragments} != set(drafts):
-            raise ValueError("叙述计划必须覆盖全部来源草稿")
+        if {(fragment.draft_id, fragment.event_id) for fragment in plan.fragments} != {
+                (key, event) for key, draft in drafts.items() for event in draft["event_ids"]}:
+            raise ValueError("叙述计划必须覆盖全部来源草稿及其事件")
         for fragment in plan.fragments:
             self.validate_fragment(fragment, drafts)
         spec = config["version"]
@@ -803,14 +840,16 @@ class NovelRestoreStorage(NovelRestoreRuntime):
 
     def validate_fragment(self, fragment, drafts):
         draft = drafts.get(fragment.draft_id)
-        if not draft or fragment.event_id != draft["event_id"] or set(fragment.action_ids) - set(draft["action_ids"]):
+        if not draft or fragment.event_id not in draft["event_ids"] or (
+                set(fragment.action_ids) - set(draft["event_action_ids"][fragment.event_id])):
             raise ValueError("片段的草稿、事件或行动引用不一致")
         if not fragment.action_ids or not fragment.purpose or not fragment.viewpoint or fragment.length_budget is None:
             raise ValueError("片段须明确具体行动来源、叙述目的、视角和篇幅预算")
-        if fragment.viewpoint_role_id is not None and fragment.viewpoint_role_id not in self.manifest["catalog"]["role"]:
+        if fragment.viewpoint_role_id is not None and not any(
+                fragment.viewpoint_role_id in d["participant_ids"] for d in drafts.values()):
             raise ValueError("片段视角引用未知人物")
         if fragment.knowledge_action_id:
-            if self.get_action(fragment.knowledge_action_id) is None:
+            if not any(fragment.knowledge_action_id in d["action_ids"] for d in drafts.values()):
                 raise ValueError("人物知情时点须指向实际已提交行动")
             if fragment.knowledge_action_id not in fragment.action_ids and not fragment.knowledge_basis:
                 raise ValueError("使用内容来源之外的知情时点须说明依据")
@@ -952,7 +991,7 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                 "missing": [identity for identity in order if identity not in state["prose"]],
                 "pending_links": [key for key, row in state["links"].items() if not self.link_current(row, state["prose"])],
                 "issues": state["issues"], "review_count": len(state["reviews"]),
-                "calls": self.connection.execute("SELECT COUNT(*) FROM calls WHERE scope=?", (scope,)).fetchone()[0]}
+                "calls": self.call_count(scope)}
 
     def record_narrative_review(self, version_id, epoch, review):
         self._writable()
@@ -1004,6 +1043,18 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                 raise ValueError("记忆编号重复，或关联不是本人的已保存记忆")
             existing.add(record.memory_id)
 
+    def search_personal_memories(self, character_id, query):
+        """人物自己提出的问题只命中当前运行中本人已提交的主观记忆正文。"""
+        limit = min(self.config.memory_candidates, self.config.recent_memories + self.config.related_memories)
+        if not query or not query.strip() or not limit:
+            return []
+        records = self.memories(character_id)
+        if any((r.run_id, r.character_id) != (self.run_id, character_id) for r in records):
+            raise MemoryCorruption("回想记录须来自本次运行中的本人")
+        if len({r.memory_id for r in records}) != len(records):
+            raise MemoryCorruption("本人主观历史包含重复的记忆编号")
+        return self.memory.search(records, query, limit)
+
     def retrieve_memories(self, character_id, *, query="", related_ids=(), through_version=None, relevant=None):
         return self.memory.select(self.memories(character_id, through_version=through_version),
                                   query=query, related_ids=related_ids, recent=self.config.recent_memories,
@@ -1033,15 +1084,22 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                                       "usage": self.usage()}
                                      if self.manifest["format"] >= 3 else {}),
                 **({"narratives": {row[0]: self.narrative_status(row[0]) for row in self.connection.execute("SELECT key FROM narratives ORDER BY key")}}
-                   if self.manifest["format"] == self.FORMAT else {})}
+                   if self.manifest["format"] >= 17 else {})}
 
 
 class NarrativeScope:
     """同一账本按叙述版本隔离任务及预算；不复制模型请求实现。"""
-    def __init__(self, storage, version_id):
+    def __init__(self, storage, version_id, *, selection_config=None):
         self.storage = storage
+        self.prior_usage = {}
+        if selection_config is not None:
+            self.scope = "selection/" + quote(version_id, safe="")
+            self.config = selection_config
+            return
         self.scope = self.scope_name(version_id)
-        self.config = NovelRestoreNarrativeConfig.model_validate(storage.narrative(version_id)["config"])
+        state = storage.narrative(version_id)
+        self.config = NovelRestoreNarrativeConfig.model_validate(state["config"])
+        self.prior_usage = state.get("selection", {}).get("usage", {})
 
     @staticmethod
     def scope_name(version_id):
@@ -1054,8 +1112,9 @@ class NarrativeScope:
         self.storage.save_job(self.scope + "/" + key, payload)
 
     def reserve(self, key, occurrence, body, limit, *, can_send):
-        return self.storage.reserve(key, occurrence, body, min(limit, self.config.max_calls), can_send=can_send,
-                                    scope=self.scope, budget_config=self.config)
+        remaining = min(limit, self.config.max_calls) - self.prior_usage.get("calls", 0)
+        return self.storage.reserve(key, occurrence, body, remaining, can_send=can_send,
+                                    scope=self.scope, budget_config=self.config, prior_usage=self.prior_usage)
 
     def received(self, call_id, status, raw, usage):
         self.storage.received(call_id, status, raw, usage)

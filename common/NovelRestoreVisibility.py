@@ -77,6 +77,8 @@ def private_perceptions(value):
 
 REVIEW_PROMPT = """你独立检查准备交给人物的文字是否符合此人的知情边界。只检查，不改写。
 candidates 是唯一准备交给人物的内容；evidence 和 private_evidence 只供世界侧取证，绝不会交给人物。
+当 evidence.operation=perceive，检查当前环境感知没有擅自带出往事回想、真实身份、失真说明或未获知的说话者。
+当 evidence.operation=process_recall，人物只可见本次回想体验。若其中提示真实说话者、被伪装者、身份转换、失真原因或世界侧来源编号，须拒收。若无依据改写或遗漏所命中的主观内容同样拒收。
 只对 candidates 中实际存在的字段提出泄漏问题，不能把世界侧私有状态误判为人物收到的文字。
 逐人完整审读，覆盖 profile、perception、working_state、memories、observations、feedback 中实际存在的全部内容。
 同时检查多份个人体验与当前视图的语义相容，不能凭字面差异或完全相同代替事实和时间依据。
@@ -135,6 +137,7 @@ def require_visible(storage, role, context):
     fields = {
         None: {"profile", "perception", "working_state", "memories"},
         "initialize_subjective": {"profile", "perception"},
+        "recall_query": {"profile", "perception", "observations", "working_state"},
         "summarize_memory": {"profile", "observations", "feedback", "working_state", "memories"},
     }.get(operation)
     metadata = {"character_id", "mode"} if operation is None else {"character_id", "operation"}
@@ -142,6 +145,9 @@ def require_visible(storage, role, context):
         raise JobFailed("人物输入含未授权字段或缺少约定字段")
     if operation is None and context["mode"] not in {"action", "talk", "think", "idle"}:
         raise JobFailed("人物行为类型不合法")
+    for field, key, prefix in (("memories", "memory_id", "r"), ("observations", "source_id", "o")):
+        if any(row.get(key) != f"{prefix}{i}" for i, row in enumerate(context.get(field, []), 1)):
+            raise JobFailed("人物输入只接受本次交付的局部引用：" + field)
     for field in fields:
         value = context[field]
         if field == "profile" and value == storage.manifest["characters"][person]:
@@ -218,20 +224,30 @@ async def visible_task(executor, job, prompt, context, schema, validate, project
         # 同一候选、私有依据与个人来源完全未变时重放原审核；任何差异仍独立审读。
         review_key = fingerprint({"context": review_context, "version": storage.current()[0]})
         review_job = reviews.setdefault(review_key, task_id("visibility", job, revision))
-        review = await executor.run_task(review_job, "world_visibility", review_prompt,
+        bounded = "approved_boundaries" in review_context.get("private_evidence", {})
+        prompt_for_review = review_prompt
+        if bounded:
+            prompt_for_review += ("\n逐事件按 private_evidence.approved_boundaries 中本批已审定的停点，检查行动、状态补丁和"
+                                  "共享 advance（包括经过的时间）是否跳过了尚可作出的选择或提前写出后果。越界写入 "
+                                  "world_issues 并拒收，不能只改个人感知。审批只许可尝试，不能作为事情已经发生或人物理应看到的依据。")
+        review = await executor.run_task(review_job, "world_visibility", prompt_for_review,
             review_context, review_schema, check_review)
+        # 审读者可能在自由文本中复述私有规划。详细意见留在审读任务，返修只传安全的范围与方向。
+        feedback = [issue.model_dump() for issue in review.issues]
+        if bounded:
+            feedback = [{"character_id": person, "path": "personal", "reason": "请按本人的实际感知条件修正个人体验。"}
+                        for person in dict.fromkeys(issue.character_id for issue in review.issues)]
         if review.world_issues:
             if context.get("operation") != "resolve_wave" or revision == storage.config.semantic_repairs:
                 raise RunStopped("世界裁定未通过事实与人物自主性检查：" + "; ".join(review.world_issues))
             # 候选尚未提交；事实本身有问题时需重新裁定，不能只改个人措辞。
             original = None
-            world_feedback = review.world_issues
-            feedback = [issue.model_dump() for issue in review.issues]
+            world_feedback = (["请按本批提议与现场依据重审实际动作、经过时间及共享后果，保留仍待人物自主作出的选择。"]
+                              if bounded else review.world_issues)
             continue
         world_feedback = []
         if review.approved:
             for person, fields in people.items():
                 record_visible(storage, person, fields, review_job)
             return candidate
-        feedback = [issue.model_dump() for issue in review.issues]
     raise JobFailed("人物交付未通过知情边界检查：" + "; ".join(i["reason"] for i in feedback))

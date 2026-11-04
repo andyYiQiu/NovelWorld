@@ -20,11 +20,27 @@ REVIEW_POLICIES = {
 }
 
 
-def review_policy(operation):
+SCHEDULE_REVIEW_POLICY = (
+    "逐事件审读本批可尝试的机会，将 scene_decisions 与实际选定的 actors、arrangements 和 initial_locations 一起核对。"
+    "依据现场状态、已提交行动和当事人尚能作出的选择，判断这一步为何现在可行。"
+    "人物的计划或主观感受只证明其当时的认识。引用到真实锚点仍须说明因果。"
+    "实际执行的是安排中的外部尝试。若它已经写过该停下的地方，即使私有说明声称会停，也要退回。"
+    "由无关条件直接推出结局、代人物选择或声称人物已经反应、"
+    "跳过人物本有时间作出的回应，都应指出具体矛盾。"
+    "若只是重复先前的安排，应核对是否有新条件、新知情视角或尚待回应的真实机会；缺少依据时给出具体缺口。"
+    "人物可以犹豫、等待或拒绝，场面也可以让另一人第一次感知同一件事。"
+    "有因果依据且确实没有反应窗口的客观变故可以获准尝试。"
+    "本轮批准只针对候选安排的可行性。实际发生了什么、经过多久及事件是否完成，要在随后的裁定与验收中确定。"
+)
+
+
+def review_policy(operation, reviewed_operation=None):
     policy = REVIEW_POLICIES.get(operation)
     if not policy:
         return ""
-    if operation == "review_semantics":
+    if operation == "review_semantics" and reviewed_operation == "schedule":
+        policy = SCHEDULE_REVIEW_POLICY
+    elif operation == "review_semantics":
         policy += "\n" + REFERENCE_STATE_POLICY
     return ("\n统一内容检查规则：" + policy +
         "\n引用存在、字段正确不等于文字结论成立。核对主体、时间、事实/主观/意图归属及因果；"
@@ -62,7 +78,7 @@ def validate_review(review, paths, evidence):
         raise ValueError("\n".join(dict.fromkeys(errors)))
 
 
-async def reviewed_task(executor, job, prompt, context, schema, validate, paths):
+async def reviewed_task(executor, job, prompt, context, schema, validate, paths, *, review_evidence=None):
     """不处理人物可见返修；这些意见仅返还世界验收任务。"""
     from agents.NovelRestoreAgent import task_id, fingerprint
     from common.Runtime import JobFailed
@@ -77,13 +93,13 @@ async def reviewed_task(executor, job, prompt, context, schema, validate, paths)
         request = context if not revision else {**context, "rejected_candidate": candidate.model_dump(mode="json"),
                                                 "semantic_feedback": feedback, "prior_lookup_evidence": lookups}
         candidate = await executor.run_task(generation, "world", prompt, request, schema, validate)
-        evidence = dict(context)
         delivery = executor.storage.get_job(generation)
         if delivery:
             for found in delivery.get("lookups", []):
                 if found not in lookups:
                     lookups.append(found)
-        if lookups:
+        evidence = review_evidence(candidate) if review_evidence is not None else dict(context)
+        if lookups and review_evidence is None:
             evidence["lookup_evidence"] = list(lookups)
         required = paths(candidate)
         for path in required:
@@ -125,6 +141,8 @@ def seal_review(storage, purpose, payload, job):
                      "goal": payload["goal"], "made_progress": payload["made_progress"]}
     elif purpose == "group":
         candidate = payload["assessment"]
+    elif purpose == "schedule":
+        candidate = payload
     else:
         raise ValueError("未知语义回执用途")
     if reviewed != {"version": storage.current()[0], "candidate": fingerprint(candidate), "review_identity": saved["identity"]}:

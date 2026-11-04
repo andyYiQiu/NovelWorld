@@ -3,11 +3,30 @@ from hashlib import sha256
 from pathlib import Path
 import random
 
+from pydantic import Field, field_validator
+
 from agents.NovelRestoreAgent import task_id
+from common.Runtime import JobFailed
+from common.NovelRestoreVisibility import is_visible, record_visible
 from common.NovelRestoreObjects import effective_catalog
 from common.NovelRestoreSchema import (
-    CharacterDecision, CharacterMemories, MemorySummary, CharacterState, PersonalPerception, SubjectiveInput,
+    CharacterDecision, CharacterMemories, MemorySummary, CharacterState, PersonalPerception, Record, SubjectiveInput,
 )
+
+
+class RecallQuery(Record):
+    query: str | None = Field(max_length=240)
+
+    @field_validator("query")
+    @classmethod
+    def meaningful(cls, value):
+        return (value.strip() or None) if value is not None else None
+
+
+def personal_recalls(memories):
+    """短编号只在本次交付内有效，不编码说话者、历史行动或来源身份。"""
+    return [{"memory_id": f"r{i}", "content": m.content, "source": m.source}
+            for i, m in enumerate(memories, 1)]
 
 
 class NovelRestoreCharacterAgent:
@@ -25,6 +44,13 @@ class NovelRestoreCharacterAgent:
         hidden = {"run_id", "action_id", "source_action_id", "position"}
         return [{k: v for k, v in (r.model_dump(mode="json") if hasattr(r, "model_dump") else r).items()
                  if k not in hidden} for r in records]
+
+    async def recall_query(self, identity, access, perception):
+        context = {"operation": "recall_query", "character_id": self.character_id, "profile": access.profile,
+                   "perception": perception, "working_state": access.working_state.model_dump(), "observations": []}
+        result = await self.executor.run_task(task_id("recall_query", identity, self.character_id), self.role,
+                                              self.prompt, context, RecallQuery)
+        return result.query
 
     async def initialize_subjective(self, identity, perception):
         def validate(state):
@@ -49,7 +75,7 @@ class NovelRestoreCharacterAgent:
         return {"character_id": self.character_id, "profile": access.profile if access.profile is not None else self.profile,
                 "position": position.model_dump(),
                 "perception": perception.model_dump(), "mode": mode, "working_state": working,
-                "memories": [m.model_dump() for m in access.memories]}
+                "memories": personal_recalls(access.memories)}
 
     @property
     def role(self):
@@ -64,8 +90,13 @@ class NovelRestoreCharacterAgent:
         if not access.working_state.needs:
             access.working_state = await self.initialize_subjective(
                 wave_id + "/observed", PersonalPerception.model_validate(observations[0]["observation"]))
+        if not is_visible(self.storage, self.character_id, "observations", observations):
+            raise JobFailed("个人体验尚未通过知情边界检查")
+        sources = {f"o{i}": row["source_id"] for i, row in enumerate(observations, 1)}
+        observations = [{**row, "source_id": alias} for alias, row in zip(sources, observations)]
+        record_visible(self.storage, self.character_id, {"observations": observations}, "approved/observation-alias")
         allowed = {row["source_id"]: row["source_kind"] for row in observations}
-        previous = {m.memory_id for m in access.memories}
+        references = {f"r{i}": m.memory_id for i, m in enumerate(access.memories, 1)}
         catalog = catalog if catalog is not None else effective_catalog(self.storage)
         objects = {row["source_id"]: {obj["perceived_id"] for obj in row["observation"]["objects"]}
                    for row in observations}
@@ -80,17 +111,27 @@ class NovelRestoreCharacterAgent:
                     raise ValueError("记忆须属于本人并准确引用行动或共享体验的来源")
                 if set(memory.perceived_ids) - objects[source]:
                     raise ValueError("记忆感知对象必须来自本人的这次体验")
-                if set(memory.corrects + memory.related_memory_ids) - previous:
+                if set(memory.corrects + memory.related_memory_ids) - references.keys():
                     raise ValueError("记忆关联与纠正只能引用本人已存在的记忆")
                 people = memory.role_ids + memory.listener_ids + ([memory.speaker_id] if memory.speaker_id else [])
                 if (set(people) - set(catalog["role"]) or set(memory.object_ids) - set(catalog["object"])
                         or set(memory.location_ids) - set(catalog["location"])):
                     raise ValueError("记忆引用了未知人物、物品或地点")
-        return await self.executor.run_task(task_id("memory", wave_id, self.character_id, revision), self.role,
+        result = await self.executor.run_task(task_id("memory", wave_id, self.character_id, revision), self.role,
             self.prompt, {"operation": "summarize_memory", "character_id": self.character_id, "profile": access.profile,
                 "observations": observations, "feedback": list(feedback),
                 "working_state": access.working_state.model_dump(),
-                "memories": [m.model_dump() for m in access.memories]}, CharacterMemories, validate)
+                "memories": personal_recalls(access.memories)}, CharacterMemories, validate)
+
+        # 人物只引用本次短编号，持久化时再绑定真正来源，回放使用相同的映射。
+        for m in result.memories:
+            if m.source_action_id:
+                m.source_action_id = sources[m.source_action_id]
+            if m.source_shared_id:
+                m.source_shared_id = sources[m.source_shared_id]
+            m.corrects = [references[i] for i in m.corrects]
+            m.related_memory_ids = [references[i] for i in m.related_memory_ids]
+        return result
 
     async def summarize_history(self, identity, records, summaries=(), revision=0, feedback=()):
         allowed = {r["memory_id"] for r in records} | {i for s in summaries for i in s["memory_ids"]}

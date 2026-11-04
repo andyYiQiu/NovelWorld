@@ -12,6 +12,7 @@ from exporters.NovelRestoreExporter import NovelRestoreExporter
 from model.ModelClient import ModelClient
 from storage.NovelRestoreLog import NovelRestoreLog
 from storage.NovelRestoreStorage import NarrativeLimitReached, NarrativeScope, NovelRestoreStorage
+from workflows.NovelRestoreBranches import branch_layout, explore, tree_status
 
 
 class NovelRestoreWorkflow:
@@ -45,6 +46,23 @@ class NovelRestoreWorkflow:
     async def run(cls, *, config=None, directory=None):
         if (config is None) == (directory is None):
             raise ValueError("必须选择新建配置或已有运行目录")
+        if config is None:
+            with NovelRestoreStorage(directory, readonly=True) as saved:
+                if saved.manifest.get("fork_node_id"):
+                    raise ValueError("请从分支树根目录恢复实验")
+                managed = saved.config.max_timelines > 1
+        else:
+            managed = config.max_timelines > 1
+        if not managed:
+            return await cls._run_segment(config=config, directory=directory)
+        if config is not None:
+            cls.execution_inputs(config)
+            with NovelRestoreStorage.create(config) as saved:
+                directory = saved.directory
+        return await explore(cls, directory)
+
+    @classmethod
+    async def _run_segment(cls, *, config=None, directory=None, request_slots=None):
         if config is not None:
             cls.execution_inputs(config)  # 在创建目录前检查，不读取密钥或请求接口。
         storage = NovelRestoreStorage.create(config) if config is not None else NovelRestoreStorage(directory)
@@ -57,12 +75,17 @@ class NovelRestoreWorkflow:
             previous = storage.get_checkpoint("execution_binding")
             if previous is not None and previous != binding:
                 raise ValueError("执行代码、提示或后端配置已变化；请保留旧运行并新建运行")
+            if storage.current()[2]["stage"] == "branch_ready":
+                exporter.export_simulation()
+                return 0, storage.status()
             storage.recover()
             storage.set_checkpoint("execution_binding", binding)
             log = NovelRestoreLog(storage.directory / "run.log.jsonl")
             client = None
             try:
                 executor, client = cls.executor(storage, backend, log)
+                if request_slots is not None:
+                    executor.semaphore = request_slots
                 try:
                     with storage.read_repository() as repository:
                         storage._check_repository(repository)
@@ -93,7 +116,24 @@ class NovelRestoreWorkflow:
     async def narrate(cls, directory, *, config=None, version_id=None):
         if (config is None) == (version_id is None):
             raise ValueError("新建叙述版本提供配置，继续版本提供 version_id")
-        with NovelRestoreStorage(directory) as storage:
+        with NovelRestoreStorage(directory, readonly=True) as storage:
+            if storage.manifest.get("fork_node_id"):
+                raise ValueError("请从分支树根目录择线并生成或继续叙述版本")
+            plan = branch_layout(storage)
+        if plan is not None:
+            from workflows.NovelRestoreSelection import resume_selection, select_and_narrate
+            if version_id is not None:
+                return await resume_selection(directory, version_id)
+            candidates = [row["directory"] for row in tree_status(directory)["leaves"]
+                          if row["stage"] == "simulation_complete" and not row.get("error")]
+            if not candidates:
+                raise ValueError("没有已完整模拟的候选叶时间轴")
+            return await select_and_narrate(directory, candidates, config)
+        return await cls._narrate_one(directory, config=config, version_id=version_id)
+
+    @classmethod
+    async def _narrate_one(cls, directory, *, config=None, version_id=None):
+        with NovelRestoreStorage(directory, narration_only=True) as storage:
             if config is not None:
                 backend, binding = cls.execution_inputs(config)
                 storage.create_narrative(config, binding)
@@ -114,9 +154,7 @@ class NovelRestoreWorkflow:
             try:
                 executor, client = cls.executor(scope, backend, log)
                 try:
-                    with storage.read_repository() as repository:
-                        storage._check_repository(repository)
-                        completed = await NovelRestoreNarration(storage, repository, version_id, executor).run()
+                    completed = await NovelRestoreNarration(storage, version_id, executor).run()
                     code = 0 if completed else 2
                 except RunStopped as error:
                     stage = "incomplete" if isinstance(error, NarrativeLimitReached) else "paused"

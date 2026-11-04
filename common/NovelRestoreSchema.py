@@ -33,6 +33,7 @@ class WorldState(AssetState):
     @model_validator(mode="before")
     @classmethod
     def snapshot_envelope(cls, value):
+        # AssetState 会剥离这两个节点字段，而运行中的 WorldState 需要保留它们。
         return value
 
     @model_serializer(mode="wrap")
@@ -74,12 +75,15 @@ class StoryPosition(Record):
         return self.node_order, self.group_order, self.round, self.turn
 
 
-class MemoryContribution(Record):
-    """角色提交内容，运行及行动身份由程序绑定。"""
+MemorySource = Literal["experience", "observation", "reported", "inference", "imagination", "plan"]
+
+
+class MemoryContent(Record):
+    """人物亲历、观察或推断的内容及来源。"""
     character_id: Identity
     kind: Literal["event", "chat", "thought"]
     content: Identity
-    source: Literal["experience", "observation", "reported", "inference", "imagination", "plan"]
+    source: MemorySource
     role_ids: list[Identity] = Field(default_factory=list)
     object_ids: list[Identity] = Field(default_factory=list)
     location_ids: list[Identity] = Field(default_factory=list)
@@ -87,11 +91,18 @@ class MemoryContribution(Record):
     listener_ids: list[Identity] = Field(default_factory=list)
     related_memory_ids: list[Identity] = Field(default_factory=list)
     corrects: list[Identity] = Field(default_factory=list)
-    importance: Annotated[int, Field(ge=1, le=5, strict=True)] = 3
     occurred_at: str | None = None
     source_action_id: Identity | None = None
     source_shared_id: Identity | None = None
     perceived_ids: list[Identity] = Field(default_factory=list, description="本次个人体验中的对象编号；不要求对应真实实体")
+
+
+class MemoryContribution(MemoryContent):
+    importance: Annotated[int, Field(ge=1, le=5, strict=True)] = 3
+
+
+class StoryMemory(MemoryContent):
+    memory_id: Identity
 
 
 class MemoryRecord(MemoryContribution):
@@ -99,6 +110,9 @@ class MemoryRecord(MemoryContribution):
     run_id: Identity
     action_id: Identity | None
     position: StoryPosition
+
+    def story_memory(self):
+        return StoryMemory.model_validate(self.model_dump(include=set(StoryMemory.model_fields)))
 
 
 class PerceivedObject(Record):
@@ -231,12 +245,24 @@ class ProcessingTrace(Record):
     explanation: Identity
 
 
-class CharacterState(Record):
-    needs: dict[Identity, Need] = Field(default_factory=dict)
+class FeltNeed(Record):
+    description: Identity
+
+
+class StoryState(Record):
+    needs: dict[Identity, FeltNeed] = Field(default_factory=dict)
     emotion: str = ""
     beliefs: list[Identity] = Field(default_factory=list)
     goals: list[Identity] = Field(default_factory=list)
     plan: list[Identity] = Field(default_factory=list)
+
+
+class CharacterState(StoryState):
+    needs: dict[Identity, Need] = Field(default_factory=dict)
+
+    def story_state(self):
+        return StoryState(**self.model_dump(exclude={"needs"}),
+                          needs={key: FeltNeed(description=need.description) for key, need in self.needs.items()})
 
 
 class MemorySummary(Record):
@@ -286,6 +312,18 @@ class RoundSchedule(Record):
         if set(self.arrangements) != {event for event, person in self.actors.items() if person is None}:
             raise ValueError("每个环境推进须有明确尝试；同一事件本批不能同时指派人物和环境")
         return self
+
+
+class SceneDecision(Record):
+    pacing: Literal["stay", "move_on"] = Field(description="保留尚有意义的选择或观察，或收束已演出的琐事，转到下一处有依据的机会。")
+    after_action_id: Identity | None = Field(description="本事件 recent_actions 的最后一条实际行动编号；本事件尚无行动时填 null。定位比较起点，不作为新结果的因果证明。")
+    focus_anchor: Identity | None = Field(default=None, description="人物机会聚焦的一项已提交行动或具体现场事实，默认取 after_action_id；环境机会沿用 arrangement.scene_anchor。程序只转交回读的事实，不向人物传递调度理由。")
+    opportunity: Identity = Field(pattern=r"\S", description="与刚才的实际经过相比，本次具体给谁什么选择或观察，或哪个已有过程可自然发展。说明继续停留或收束的理由。")
+    stop_before: Identity = Field(pattern=r"\S", description="本次机会止于何处；应留给谁回应，或哪项后果仍需实际裁定。不能预写当事人的选择或事件结局。")
+
+
+class ReplanSchedule(RoundSchedule):
+    scene_decisions: dict[Identity, SceneDecision]
 
 
 class CharacterMemories(Record):
@@ -419,7 +457,17 @@ class WorldAdvance(WaveAdvance):
     final_views: dict[Identity, WorldPerception] = Field(default_factory=dict)
 
 
-class StoryMaterial(Record):
+class RecallExperience(Record):
+    """人物当时体验到的回想。世界侧的命中编号、映射、诊断不进入这个结构。"""
+    content: Identity
+    source: MemorySource
+
+    @classmethod
+    def from_action_context(cls, context):
+        return [cls(content=m["content"], source=m["source"]) for m in context.get("memories", [])]
+
+
+class Format17StoryMaterial(Record):
     """模拟已产生的故事内容；不含幕后计划、状态补丁或审核记录。"""
     action_id: Identity
     position: StoryPosition
@@ -427,19 +475,23 @@ class StoryMaterial(Record):
     result: Identity
     perceptions_before: dict[Identity, PersonalPerception]
     experiences: dict[Identity, PersonalPerception]
-    memories: list[MemoryContribution]
-    working_states: dict[Identity, CharacterState]
-    background_result: str = ""
+    memories: list[StoryMemory]
+    working_states: dict[Identity, StoryState]
+
+
+class StoryMaterial(Format17StoryMaterial):
+    recollections_before: list[RecallExperience]
 
 
 class SharedStoryMaterial(Record):
+    turn: PositiveInt
     shared_id: Identity
     group_id: Identity
     result: Identity
     related_event_ids: list[Identity] = Field(default_factory=list)
     experiences: dict[Identity, PersonalPerception] = Field(default_factory=dict)
-    memories: list[MemoryContribution] = Field(default_factory=list)
-    working_states: dict[Identity, CharacterState] = Field(default_factory=dict)
+    memories: list[StoryMemory] = Field(default_factory=list)
+    working_states: dict[Identity, StoryState] = Field(default_factory=dict)
 
 
 class ConfirmedAction(Record):
@@ -465,16 +517,20 @@ class ConfirmedAction(Record):
     subjective_inputs: dict[Identity, SubjectiveInput] = Field(default_factory=dict)
     working_states: dict[Identity, CharacterState] = Field(default_factory=dict)
 
+    recollections_before: list[RecallExperience] = Field(default_factory=list)
+
     def story_material(self):
-        return StoryMaterial(action_id=self.action_id, position=self.position,
+        return StoryMaterial(action_id=self.action_id, position=self.position, recollections_before=self.recollections_before,
             proposal=self.proposal if self.proposal.character_id is not None else None,
             result=self.result, perceptions_before={p: v.personal for p, v in self.views_before.items()},
             experiences={p: v.personal for p, v in self.observations.items()},
-            memories=[MemoryContribution.model_validate(m.model_dump(include=set(MemoryContribution.model_fields)))
-                      for m in self.memories], working_states=self.working_states)
+            memories=[m.story_memory() for m in self.memories],
+            working_states={p: state.story_state() for p, state in self.working_states.items()})
 
     @model_validator(mode="after")
     def matching_memories(self):
+        if self.recollections_before and self.proposal.character_id is None:
+            raise ValueError("仅人物行动可以携带行动前回想")
         keys = [(row.character_id, row.memory_id) for row in self.memories]
         if len(set(keys)) != len(keys):
             raise ValueError("同一人物的记忆身份重复")
@@ -502,7 +558,14 @@ class EventOutcome(Record):
         return self
 
 
+class LegacyStoryMaterial(Format17StoryMaterial):
+    memories: list[MemoryContribution]
+    working_states: dict[Identity, CharacterState]
+    background_result: str = ""
+
+
 class EventDraft(Record):
+    """格式 16 及以前的历史事件草稿，只读。"""
     draft_id: Identity
     run_id: Identity
     event_id: Identity
@@ -513,8 +576,33 @@ class EventDraft(Record):
     action_ids: list[Identity] = Field(min_length=1)
     achieved_results: list[str]
     text: Identity
-    materials: list[StoryMaterial] = Field(default_factory=list)
+    materials: list[LegacyStoryMaterial] = Field(default_factory=list)
     shared_material_ids: list[Identity] = Field(default_factory=list)
+
+
+class Format17GroupDraft(Record):
+    """一个通过验收的事件组。一批内的行动同时发生，公共经历只归档一次。"""
+    draft_id: Identity
+    run_id: Identity
+    group_id: Identity
+    event_ids: list[Identity] = Field(min_length=1)
+    node_id: Identity
+    node_order: PositiveInt
+    group_order: PositiveInt
+    participant_ids: list[Identity]
+    participant_names: dict[Identity, str]
+    action_ids: list[Identity] = Field(min_length=1)
+    event_action_ids: dict[Identity, list[Identity]]
+    batch_elapsed_seconds: dict[int, float]
+    achieved_results: dict[Identity, list[str]]
+    materials: list[Format17StoryMaterial] = Field(min_length=1)
+    shared_materials: list[SharedStoryMaterial]
+    shared_material_ids: list[Identity]
+    text: Identity
+
+
+class GroupDraft(Format17GroupDraft):
+    materials: list[StoryMaterial] = Field(min_length=1)
 
 
 class NarrativeFragment(Record):

@@ -66,6 +66,25 @@ def interaction_progress(events, eligible, *, group, recent=5):
     return result
 
 
+def pending_observations(events, interactions):
+    """重规划审读用实际个人反馈核对尚待回应的机会，不从反馈次数推断人物看见了什么。"""
+    pending = {}
+    for item in interactions.values():
+        for person, opportunity in item["opportunities"].items():
+            source = opportunity["feedback_without_later_opportunity"]["latest_source_id"]
+            if source:
+                pending.setdefault(source, set()).add(person)
+    result = {}
+    for actions in events.values():
+        for action in actions:
+            advance = action.get("advance") or {}
+            for source, record in ((action["action_id"], action), (advance.get("shared_id"), advance)):
+                if source in pending and source not in result:
+                    result[source] = {person: record["observations"][person]["personal"]
+                                      for person in sorted(pending[source])}
+    return result
+
+
 def compact_next_reference(target, following):
     """仅当六类状态逐项完全相同时复用目标；节点标识仍独立提供。"""
     sections = {"characters", "objects", "locations", "relations", "public_state", "constraints"}
@@ -97,28 +116,18 @@ def link_components(links):
     return components
 
 
-def repository_reference(world, event_ids=None):
-    """只缩小事件范围，不把草稿的概括当成 repository 的核心要求。"""
-    events = None if event_ids is None else set(event_ids)
-    groups = [g for g in world["groups"] if events is None or
-              any(e["task_id"] in events for e in g["events"])]
-    nodes = {g["node_id"] for g in groups}
-    selected = {g["group_id"] for g in groups}
-    # 保留同节点前序组，供核对参考状态的演变；同组要求不能拆给单个事件。
-    last = {node: max(g["order"] for g in groups if g["node_id"] == node) for node in nodes}
-    return {"assets": world["assets"], "worlds": world["worlds"],
-            "nodes": [n for n in world["nodes"] if n["node_id"] in nodes],
-            "state_before": {n: world["state_before"][n] for n in world["state_before"] if n in nodes},
-            "groups": groups,
-            "preceding_groups": [g for g in world["groups"] if g["node_id"] in nodes
-                                 and g["order"] <= last[g["node_id"]] and g["group_id"] not in selected]}
+def narrative_index(source):
+    """以已冻结的组草稿及其已发生结果建立全书索引。"""
+    fields = ("draft_id", "group_id", "event_ids", "node_order", "group_order", "achieved_results")
+    return {"run_id": source["run_id"], "drafts": [{k: d[k] for k in fields} for d in source["drafts"]]}
 
 
 def simulation_source(source, event_ids, action_ids=None):
     """草稿保持完整；actions 是草稿中的故事材料索引，不读取模拟运行日志。"""
     events = set(event_ids)
     selected = None if action_ids is None else set(action_ids)
-    drafts = [d for d in source["drafts"] if d["event_id"] in events]
+    drafts = [d for d in source["drafts"] if events.intersection(d["event_ids"])]
+    events = {event for d in drafts for event in d["event_ids"]}
     shared_ids = {identity for draft in drafts for identity in draft.get("shared_material_ids", [])}
     # 已提供完整结构材料时，不重复发送同一内容的阅读投影；片段选择仍保留完整草稿。
     visible_drafts = [{k: v for k, v in d.items() if k != "text"} for d in drafts] if selected is None else drafts

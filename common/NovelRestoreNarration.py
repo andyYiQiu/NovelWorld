@@ -1,19 +1,19 @@
 """固定章节位置下的串行联合任务；正文和关系的真值由存储事务维护。"""
 from agents.NovelRestoreNarratorAgent import NovelRestoreNarratorAgent
-from agents.NovelRestoreWorldAgent import NovelRestoreWorldAgent
+from agents.NovelRestoreNarrativeReview import NovelRestoreNarrativeReview
 from common.NovelRestoreSchema import NarrativePlan, NarrativeSelection
 from common.Runtime import JobFailed, RunStopped
 from storage.NovelRestoreStorage import encode
-from common.NovelRestoreContext import repository_reference, simulation_source, fragment_index, link_components
+from common.NovelRestoreContext import simulation_source, fragment_index, link_components
 
 
 class NovelRestoreNarration:
-    def __init__(self, storage, repository, version_id, executor):
+    def __init__(self, storage, version_id, executor):
         self.storage, self.version_id = storage, version_id
         self.source = storage.check_narrative_source(version_id)
         self.drafts = {row["draft_id"]: row for row in self.source["drafts"]}
         self.narrator = NovelRestoreNarratorAgent(storage, version_id, executor)
-        self.world = NovelRestoreWorldAgent(storage, repository, executor)
+        self.world = NovelRestoreNarrativeReview(storage, executor)
 
     @staticmethod
     def neighbors(plan, identity, window):
@@ -35,7 +35,7 @@ class NovelRestoreNarration:
         loaded.update(chain)
         ordered = [identity for identity in plan.reading_order if identity in loaded]
         source_ids = list(dict.fromkeys(fragments[identity]["draft_id"] for identity in ordered))
-        event_ids = {self.drafts[identity]["event_id"] for identity in source_ids}
+        event_ids = {event for identity in source_ids for event in self.drafts[identity]["event_ids"]}
         action_ids = {a for i in ordered for a in fragments[i]["action_ids"]}
         context = {"requirements": state["config"]["requirements"], "version": state["config"]["version"],
                 "assignment": state["assignment"],
@@ -45,7 +45,6 @@ class NovelRestoreNarration:
                 "windows": {key: {"before": value[0], "after": value[1]} for key, value in windows.items()},
                 "fragments": [fragments[identity] for identity in ordered],
                 **simulation_source(self.source, event_ids, action_ids),
-                "repository": repository_reference(self.world.world, event_ids),
                 "action_scope": "所载片段明确引用的行动明细；完整事件过程保留在草稿中",
                 "prose": {identity: state["prose"][identity] for identity in ordered if identity in state["prose"]},
                 "links": related, "issues": state["issues"], "plan_revision": plan.revision,
@@ -62,22 +61,15 @@ class NovelRestoreNarration:
             if not person:
                 continue
             ids = [fragment["knowledge_action_id"]] if fragment.get("knowledge_action_id") else fragment["action_ids"]
-            actions = [self.storage.get_action(i) for i in ids]
-            # 同一批次整体生效；不得把批内 SQL 行序号当成人物获知先后。
-            bases = [a.expected_version for a in actions]
-            cutoff = max(self.storage.connection.execute(
-                "SELECT MAX(version) FROM actions WHERE status='committed' AND json_extract(payload,'$.expected_version')=?",
-                (base,)).fetchone()[0] for base in bases)
-            context["character_knowledge"][identity] = [m.model_dump(mode="json") for m in self.storage.retrieve_memories(
-                person, query=fragment["selected_content"], through_version=cutoff)]
+            context["character_knowledge"][identity] = self.knowledge_at(person, ids)
         limit = state["config"]["context_chars"]
         if len(encode(context)) > limit:
             mandatory = set(targets) | chain
             full_drafts = {fragments[i]["draft_id"] for i in mandatory}
             context["drafts"] = [d if d["draft_id"] in full_drafts else
-                {k: d[k] for k in ("draft_id", "event_id", "achieved_results")} for d in context["drafts"]]
+                {k: d[k] for k in ("draft_id", "event_ids", "achieved_results")} for d in context["drafts"]]
             context["actions"] = simulation_source(self.source,
-                {self.drafts[i]["event_id"] for i in full_drafts},
+                {event for i in full_drafts for event in self.drafts[i]["event_ids"]},
                 {a for i in mandatory for a in fragments[i]["action_ids"]})["actions"]
             for identity in set(context["prose"]) - mandatory:
                 meta = state.get("prose_meta", {}).get(identity, {})
@@ -87,6 +79,36 @@ class NovelRestoreNarration:
         if len(encode(context)) > limit:
             raise RunStopped("联合任务必要来源超出上下文预算，未静默截断；请用更细片段或更大预算的新版本")
         return context
+
+    def knowledge_at(self, person, anchors):
+        """只投影视角锚点批次实际获得的资料，不把旧记忆当成本次回想。"""
+        def batch(position):
+            return position["node_order"], position["group_order"], position["turn"]
+
+        actions = [a for rows in self.source["actions"].values() for a in rows]
+        anchor_batches = {batch(a["position"]) for a in actions if a["action_id"] in anchors}
+        records = []
+        def collect(item, position):
+            if batch(position) not in anchor_batches:
+                return
+            view = item.get("perceptions_before", {}).get(person)
+            actor = (item.get("proposal") or {}).get("character_id")
+            recalls = item.get("recollections_before", []) if actor == person else []
+            experience = item["experiences"].get(person)
+            memories = [{k: m[k] for k in ("content", "source")} for m in item["memories"]
+                        if m["character_id"] == person]
+            if view or recalls or experience or memories:
+                records.append({"position": position, "perception_before": view, "recollections_before": recalls,
+                                "experience_after": experience, "memories_formed_after": memories})
+
+        for action in actions:
+            collect(action, action["position"])
+        for draft in self.source["drafts"]:
+            for identity in draft["shared_material_ids"]:
+                shared = self.source["shared_materials"][identity]
+                collect(shared, {"node_order": draft["node_order"], "group_order": draft["group_order"],
+                                 "turn": shared["turn"], "event_id": None})
+        return sorted(records, key=lambda row: batch(row["position"]))
 
     def next_pending(self, state):
         plan = NarrativePlan.model_validate(state["plan"])
@@ -114,7 +136,7 @@ class NovelRestoreNarration:
         state = self.storage.narrative(self.version_id)
         if state["plan"] is None:
             self.storage.save_narrative_plan(self.version_id, await self.narrator.plan(
-                self.source, state["assignment"], self.world.world))
+                self.source, state["assignment"]))
         while True:
             state = self.storage.narrative(self.version_id)
             if state["stage"] == "complete":

@@ -3,7 +3,7 @@ from itertools import groupby
 
 
 def story_text(actions, characters, event_id=None):
-    """同批行动不宣称先后；共享经过放在整批之后，相关事件各自引用。"""
+    """同批行动不宣称先后，共享经过只出现一次。正式组草稿使用完整批次。"""
     lines = []
     sources = {"experience": "亲历", "observation": "观察", "reported": "转述",
                "inference": "推断", "imagination": "想象", "plan": "打算"}
@@ -47,6 +47,9 @@ def story_text(actions, characters, event_id=None):
             material = action.story_material()
             perceptions(material.perceptions_before, "行动前所感")
             if material.proposal:
+                for recall in material.recollections_before:
+                    section(f"行动前的个人回想（{name(material.proposal.character_id)}；{sources[recall.source]}）",
+                            recall.content)
                 section(f"本人意图（{name(material.proposal.character_id)}；尚不代表实现）",
                         material.proposal.content)
             label = "同时发生的实际经过" if len(selected) > 1 else "实际经过"

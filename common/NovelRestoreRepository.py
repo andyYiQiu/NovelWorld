@@ -10,6 +10,22 @@ from contract.NovelWorldStateSchema import require_state_sections
 from contract.NovelWorldState import public_state
 
 
+def require_public_input(value):
+    """公开资料可以描述故事，但不能携带原书正文、摘录或上游取证附件。"""
+    private_fields = {"evidence", "unverified_quote", "source_text", "original_text", "full_text",
+                      "raw_text", "source_excerpt", "original_quote", "原文", "原文摘录", "原文证据"}
+    def visit(item):
+        if isinstance(item, dict):
+            for key, row in item.items():
+                if key.casefold() in private_fields:
+                    raise ValueError(f"公开资料不能包含原文证据或正文：{key}")
+                visit(row)
+        elif isinstance(item, list):
+            for row in item:
+                visit(row)
+    visit(value)
+
+
 def validate_event(event, assets):
     """核对单个公开事件的字段以及人物、物品和地点引用。"""
     identity = event.get("task_id")
@@ -44,8 +60,7 @@ class PublicRepository:
 
     @staticmethod
     def parse_group(node_id, node_order, raw, catalog):
-        if public_state(raw, False) != raw:
-            raise ValueError("公开事件组不能包含原文证据")
+        require_public_input(raw)
         validate_state(raw.get("state_delta"), catalog, "事件组变化", delta=True)
         if "node_id" in raw or "node_order" in raw:
             raise ValueError("事件组不能覆盖所属节点")
@@ -62,8 +77,7 @@ class PublicRepository:
 
     @staticmethod
     def parse_snapshot(node_id, raw):
-        if public_state(raw, False) != raw:
-            raise ValueError("公开快照不能包含原文证据")
+        require_public_input(raw)
         require_state_sections(raw, "节点入口快照")
         snapshot = NodeSnapshot.model_validate(raw)
         if snapshot.node_id != node_id:
@@ -90,8 +104,7 @@ class PublicRepository:
             if "significance" in item:
                 raise ValueError(f"{key}: 剧情作用不属于静态物品档案")
         worlds = self.worlds()
-        if public_state(assets, False) != assets or public_state(worlds, False) != worlds:
-            raise ValueError("公开资料不能包含原文证据")
+        require_public_input([assets, worlds, self.nodes()])
 
         seen_events, seen_groups = set(), set()
         previous, expected = None, None
