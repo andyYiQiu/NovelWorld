@@ -1,76 +1,149 @@
-"""AutoGen 的唯一 HTTP 边界：配置、累计预算、持久请求及断点回放。"""
+"""官方 OpenAI SDK 传输与 AutoGen 工具消息适配；账本仍由本项目负责。
+
+消息转换直接复用 microsoft/autogen 的 python-v0.7.5 _openai_client；
+HTTP 使用 openai/openai-python v1.109.1 的 with_raw_response，先记账后解析。
+固定依赖版本是这些上游内部转换函数的兼容边界，不在这里实现 agent 循环。
+"""
 import asyncio
-from contextvars import ContextVar
-import json
 import math
 import os
 import re
 from urllib.parse import urlsplit
 
 from autogen_core import FunctionCall
-from autogen_core.models import ChatCompletionClient, CreateResult, RequestUsage
+from autogen_core.models import (AssistantMessage, ChatCompletionClient, CreateResult,
+                                FunctionExecutionResultMessage, RequestUsage, SystemMessage, UserMessage)
+from autogen_ext.models.openai._openai_client import convert_tool_choice, convert_tools, to_oai_type
 import httpx
+from httpx import AsyncClient as HTTPClient
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI
+from openai._models import construct_type
+from openai.types.chat import ChatCompletion, ChatCompletionMessageFunctionToolCall
 
-from common.Runtime import RunStopped, digest, encode, require
-
-CALL_SCOPE = ContextVar('novel_call_scope', default=None)
+from common.Runtime import CALL_SCOPE, RunStopped, check_batch, digest, encode, require
+from tools.JsonInput import loads
+from tools.TokenBudget import usage_counts_valid
 
 
 class ModelResponseError(Exception):
-    """接口未交付完整的文本或工具响应；不同于业务内容未通过检查。"""
+    """接口未交付可用响应；不同于业务内容未通过检查。"""
 
 
 class ModelTransportError(ModelResponseError):
     """接口连接或暂时不可用，已耗尽网络层重试。"""
 
 
-def compact_tool_schema(value):
-    """只去掉Schema标题注释；约束、说明和业务字面值原样保留。"""
-    if isinstance(value, list):
-        return [compact_tool_schema(item) for item in value]
-    if isinstance(value, dict):
-        return {key: (item if key in ('default', 'const', 'enum', 'examples') else compact_tool_schema(item))
-                for key, item in value.items() if not (key == 'title' and isinstance(item, str))}
-    return value
+class RequestContextTooLarge(RunStopped):
+    """完整请求尚未发送；允许调用方在保持必要资料完整时收束会话历史。"""
+
+
+class ModelDeliveryError(ModelResponseError):
+    """已收到 HTTP 200，但无完整可用交付；保留回执交由任务级策略处理。"""
+
+    def __init__(self, message, *, calls=(), errors=None, thought=None):
+        super().__init__(message)
+        self.calls = list(calls)
+        self.errors = errors or {}
+        self.thought = thought
+
+
+def receipt_usage(payload):
+    """保留回执的费用字段；矛盾计数由账本记作未知，有效分项只提高预留。"""
+    usage = payload.get('usage') if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return {}
+    try:
+        encode(usage).encode('utf-8')
+    except (ValueError, RecursionError):
+        return {}
+    return usage
+
+
+def request_metrics(body):
+    """Wire sizes, not estimated billable tokens; usage comes from the provider."""
+    messages = body.get('messages', [])
+    first_user = next((i for i, message in enumerate(messages) if message.get('role') == 'user'), None)
+    return {'request_chars': len(encode(body)), 'tool_chars': len(encode(body.get('tools', []))),
+            'message_chars': {role: sum(len(encode(m)) for m in messages if m.get('role') == role)
+                              for role in ('system', 'user', 'assistant', 'tool')},
+            'initial_context_chars': len(encode(messages[first_user])) if first_user is not None else 0,
+            'continuation_chars': sum(len(encode(m)) for m in messages[first_user + 1:]) if first_user is not None else 0,
+            'reasoning_chars': sum(len(m.get('reasoning_content') or '') for m in messages)}
+
+
+def transport_messages(messages, model):
+    """Keep provider reasoning in its native field, never turn it into story text.
+
+    AutoGen supplies thought from CreateResult. In this client it comes solely
+    from the provider's reasoning_content, so retain it for tool continuations
+    as required by DeepSeek, while using the SDK for all other message fields.
+    """
+    converted = []
+    for message in messages:
+        thought = message.thought if isinstance(message, AssistantMessage) else None
+        clean = message.model_copy(update={'thought': None}) if thought is not None else message
+        parts = to_oai_type(clean, model=model, include_name_in_message=False)
+        for part in parts:
+            if thought is not None and part['role'] == 'assistant':
+                part = {**part, 'reasoning_content': thought}
+            converted.append(part)
+    return converted
 
 
 class ModelClient(ChatCompletionClient):
     def __init__(self, config, storage, log, max_calls, max_request_chars=0):
         self.config, self.storage, self.log = config, storage, log
-        self.limit = min(max_calls, config['max_calls'])
+        self.limit = min((n for n in (max_calls, config['max_calls']) if n is not None), default=None)
         self.max_request_chars = max_request_chars
         self.stopped = None
         self.usage = RequestUsage(0, 0)
+        self._sdk = None
 
     @staticmethod
     def read_config(path):
         with open(path, encoding='utf-8') as stream:
-            config = json.load(stream)
-        require(isinstance(config, dict), '模型配置须为对象')
+            config = loads(stream.read(), location=str(path), expected=dict)
+        def check(condition, message):
+            require(condition, f'{path}: {message}')
+        def finite(value):
+            if type(value) not in (int, float):
+                return False
+            try:
+                return math.isfinite(value)
+            except OverflowError:
+                return False
         allowed = {'api_url', 'model', 'api_key_env', 'timeout_seconds', 'max_retries', 'max_calls', 'request_options'}
-        require(not set(config) - allowed, '不支持的模型配置字段：' + str(sorted(set(config) - allowed)))
-        require(all(isinstance(config.get(k), str) and config[k].strip()
+        check(not set(config) - allowed, '不支持的模型配置字段：' + str(sorted(set(config) - allowed)))
+        check(all(isinstance(config.get(k), str) and config[k].strip()
                     for k in ('api_url', 'model', 'api_key_env')), '缺少模型、接口或密钥环境变量名')
-        parsed = urlsplit(config['api_url'])
-        require(parsed.scheme in ('http', 'https') and parsed.hostname and not parsed.username
+        try:
+            parsed = urlsplit(config['api_url'])
+            port = parsed.port  # urlsplit 本身不会检查端口的格式或范围。
+            httpx.URL(config['api_url'])  # 使用实际发送器的地址规则，尚不构造请求或读取密钥。
+        except (ValueError, httpx.InvalidURL) as error:
+            raise ValueError(f'{path}: api_url 地址、主机或端口非法') from error
+        check(parsed.scheme in ('http', 'https') and parsed.hostname and not parsed.username
                 and not parsed.password and not parsed.query and not parsed.fragment
+                and (port is None or port > 0) and not any(char.isspace() for char in config['api_url'])
                 and parsed.path.endswith('/chat/completions'), 'api_url 须为完整 Chat Completions 接口')
-        require(bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', config['api_key_env'])), '密钥环境变量名非法')
+        check(bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', config['api_key_env'])), '密钥环境变量名非法')
         for key in ('max_calls', 'max_retries'):
-            require(type(config.get(key)) is int and config[key] >= (1 if key == 'max_calls' else 0), key + ' 非法')
+            if key == 'max_calls' and key in config and config[key] is None:
+                continue  # 显式 null 解除请求次数预算，未配置或非法值仍拒绝。
+            check(type(config.get(key)) is int and config[key] >= (1 if key == 'max_calls' else 0), key + ' 非法')
         timeout = config.get('timeout_seconds')
-        require(type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0, 'timeout_seconds 非法')
+        check(finite(timeout) and timeout > 0, 'timeout_seconds 须为可用于请求的有限正数')
         options = config.get('request_options', {})
-        require(isinstance(options, dict) and not set(options) - {'temperature', 'max_tokens', 'top_p', 'seed'},
+        check(isinstance(options, dict) and not set(options) - {'temperature', 'max_tokens', 'top_p', 'seed'},
                 'request_options 仅允许 temperature/max_tokens/top_p/seed')
         for key, value in options.items():
-            require(type(value) in (int, float) and math.isfinite(value), key + ' 须为有限数值')
+            check(finite(value), 'request_options.' + key + ' 须为可用于请求的有限数值')
             if key in ('seed', 'max_tokens'):
-                require(type(value) is int and (key == 'seed' or value > 0), key + ' 非法')
+                check(type(value) is int and (key == 'seed' or value > 0), key + ' 非法')
             if key == 'temperature':
-                require(0 <= value <= 2, 'temperature 须在 0 到 2 之间')
+                check(0 <= value <= 2, 'temperature 须在 0 到 2 之间')
             if key == 'top_p':
-                require(0 < value <= 1, 'top_p 须在 0 到 1 之间')
+                check(0 < value <= 1, 'top_p 须在 0 到 1 之间')
         return config
 
     @property
@@ -84,38 +157,29 @@ class ModelClient(ChatCompletionClient):
 
     async def create(self, messages, *, tools=(), tool_choice='auto', json_output=None,
                      extra_create_args=None, cancellation_token=None):
-        require(not json_output and not extra_create_args, '不接受隐式模型参数或服务端 JSON 约束')
+        require(not json_output and not extra_create_args, '使用原生工具交付，不接受隐式模型参数或额外 JSON 模式')
         scope = CALL_SCOPE.get()
         require(scope is not None, '模型请求必须属于持久化智能体任务')
-        converted = []
         for message in messages:
-            if type(message).__name__ == 'FunctionExecutionResultMessage':
-                converted.extend({'role': 'tool', 'tool_call_id': result.call_id, 'content': result.content}
-                                 for result in message.content)
-                continue
-            role = {'SystemMessage': 'system', 'UserMessage': 'user', 'AssistantMessage': 'assistant'}.get(type(message).__name__)
-            if role == 'assistant' and isinstance(message.content, list):
-                require(all(isinstance(call, FunctionCall) for call in message.content), '工具消息类型非法')
-                converted.append({'role': role, 'content': None, 'tool_calls': [
-                    {'id': call.id, 'type': 'function',
-                     'function': {'name': call.name, 'arguments': call.arguments}} for call in message.content]})
-            else:
-                require(role and isinstance(message.content, str), '仅支持文本及工具消息')
-                converted.append({'role': role, 'content': message.content})
-            if role == 'assistant' and getattr(message, 'thought', None) is not None:
-                # DeepSeek 思考模式的工具会话要求回传此前模型响应的 reasoning_content。
-                converted[-1]['reasoning_content'] = message.thought
+            require(isinstance(message, (SystemMessage, UserMessage, AssistantMessage, FunctionExecutionResultMessage)),
+                    '模型通道只接受 AutoGen 原生文本及工具消息')
+            require(not isinstance(message, UserMessage) or isinstance(message.content, str),
+                    '当前模型配置不支持多模态输入')
+        converted = transport_messages(messages, self.config['model'])
+        from tools.ContextReferences import compact_messages
+        converted = compact_messages(converted)
         body = {'model': self.config['model'], 'messages': converted, **self.config.get('request_options', {})}
         if tools:
-            require(tool_choice == 'auto', '工具选择须由智能体决定')
-            body.update(tools=[{'type': 'function', 'function': {
-                key: compact_tool_schema(value) if key == 'parameters' else value
-                for key, value in (tool if isinstance(tool, dict) else tool.schema).items()
-                if key in ('name', 'description', 'parameters', 'strict')}} for tool in tools],
-                tool_choice='auto', parallel_tool_calls=False)
-        if self.max_request_chars and len(encode(body)) > self.max_request_chars:
-            raise RunStopped(f'完整请求 {len(encode(body))} 字符超出 --max-request-chars={self.max_request_chars}；'
-                             '尚未发送，工作区保留；不截断依据或重复尝试同一超长请求')
+            body.update(tools=convert_tools(tools), tool_choice=convert_tool_choice(tool_choice))
+        else:
+            require(tool_choice in ('auto', 'none'), '强制工具选择须提供实际工具')
+        size = len(encode(body))
+        limits = (("--max-request-chars", self.max_request_chars),
+                  ("context_chars", getattr(self.storage.config, "context_chars", 0)))
+        for name, limit in limits:
+            if limit and size > limit:
+                raise RequestContextTooLarge(f'完整请求 {size} 字符超出 {name}={limit}；'
+                                 '尚未发送，工作区保留；不截断依据或重复尝试同一超长请求')
         operation = asyncio.create_task(self.request(scope, body))
         if cancellation_token:
             cancellation_token.link_future(operation)
@@ -123,8 +187,12 @@ class ModelClient(ChatCompletionClient):
 
     async def request(self, scope, body):
         """任务/修复轮次确定请求身份，重启与并发交错不改变回放归属。"""
+        require(not any(key in body for key in ('functions', 'response_format')),
+                '交付使用 SDK 原生 tools，不使用旧 functions 或额外 JSON 输出模式')
         key = digest({'scope': scope, 'body': body})
         for attempt in range(self.config['max_retries'] + 1):
+            # 批次已失败时不能绕过语义入口继续 HTTP 重试；已发出的请求仍收回回执。
+            check_batch()
             if self.stopped:
                 raise RunStopped(self.stopped)
             secret = os.environ.get(self.config['api_key_env'], '')
@@ -136,29 +204,50 @@ class ModelClient(ChatCompletionClient):
                 self.stopped = str(exc)
                 raise
             call_id = row['id']
-            transient = None
+            transient, payload = None, None
             if replay:
                 self.log.write('replay', call=call_id, job=scope)
                 raw, status, transient = row['response'], row['status'], row['error']
             else:
-                self.log.write('request', call=call_id, job=scope, request=body)
                 try:
-                    async with httpx.AsyncClient(timeout=self.config['timeout_seconds'], follow_redirects=False,
-                                                 trust_env=False) as client:
-                        response = await client.post(self.config['api_url'], json=body,
-                                                     headers={'Authorization': 'Bearer ' + secret})
-                    raw, status = response.text.replace(secret, '[REDACTED]'), response.status_code
+                    self.log.write('request', call=call_id, job=scope, request=body, metrics=request_metrics(body))
+                    # 仅真实发送时建连接池；回放不需要网络客户端或密钥。
+                    if self._sdk is None:
+                        self._sdk = AsyncOpenAI(api_key=secret,
+                            base_url=self.config['api_url'].removesuffix('/chat/completions') + '/',
+                            http_client=HTTPClient(timeout=self.config['timeout_seconds'], follow_redirects=False,
+                                                   trust_env=False), max_retries=0)
+                    self._sdk.api_key = secret
                     try:
-                        payload = json.loads(raw)
+                        receipt = await self._sdk.chat.completions.with_raw_response.create(**body)
+                        response = receipt.http_response
+                    except APIStatusError as exc:
+                        response = exc.response
+                    raw, status = response.content.replace(secret.encode('utf-8'), b'[REDACTED]'), response.status_code
+                    try:
+                        raw = raw.decode('utf-8')
+                    except UnicodeDecodeError:
+                        # SQLite 原样保留损坏字节；严格 JSON 入口拒绝它，不能替换正文后接收。
+                        pass
+                    try:
+                        payload = loads(raw, location='接口响应', expected=dict)
                     except ValueError:
                         payload = {}
-                    usage = payload.get('usage', {}) if isinstance(payload, dict) else {}
+                    usage = receipt_usage(payload)
                     self.storage.received(call_id, status, raw, usage)
                     self.log.write('received', call=call_id, job=scope, status=status, usage=usage, body=raw)
-                except httpx.TransportError as exc:
-                    transient = type(exc).__name__
+                except APIConnectionError as exc:
+                    cause = exc.__cause__
+                    transient = type(cause).__name__ if cause is not None else type(exc).__name__
+                    if not isinstance(cause, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+                        # 请求可能已送达，留下无回执账目；resume 不应重复发出同一请求。
+                        self.log.write('delivery_unknown', call=call_id, job=scope, error=transient)
+                        self.stopped = f'请求送达结果未知（{transient}），保留账本等待核查'
+                        raise RunStopped(self.stopped) from exc
                     self.storage.failed(call_id, transient)
                     self.log.write('error', call=call_id, job=scope, error=transient)
+                finally:
+                    self.storage.release_call(call_id)
             if transient or status == 429 or status is not None and 500 <= status < 600:
                 if attempt < self.config['max_retries']:
                     if not replay:
@@ -171,42 +260,78 @@ class ModelClient(ChatCompletionClient):
             if status != 200:
                 raise ModelResponseError(f'接口返回 HTTP {status}，完整响应已保存')
             try:
-                payload = json.loads(raw)
-                choice = payload['choices'][0]
-                finish = choice['finish_reason']
-                message = choice['message']
-                content = message.get('content')
-                thought = message.get('reasoning_content')
-                if thought is not None and not isinstance(thought, str):
-                    raise ModelResponseError('接口返回的 reasoning_content 不是文本')
+                # 记账与交付共用同一读取入口；正常请求复用已解析对象，回放再读取原回执。
+                # BOM 等合法表示不能导致正文已接收、实际 usage 却被记为未知。
+                if payload is None:
+                    payload = loads(raw, location='接口响应', expected=dict)
+                # 与 SDK BaseClient._process_response_data 的默认转换相同。
+                # 使用同一转换回放已保存回执，无须创建客户端、读取密钥或再次联网。
+                completion = construct_type(type_=ChatCompletion, value=payload)
+                choice = completion.choices[0]
+                finish, message = choice.finish_reason, choice.message
+                content = message.content
+                thought = getattr(message, 'reasoning_content', None)
+                # 可选元数据不决定业务交付是否有效；原始值仍完整保存在 HTTP 回执。
+                if not isinstance(thought, str):
+                    thought = None
                 if finish == 'content_filter':
                     self.stopped = '接口返回 content_filter；响应保留，不执行或重试'
                     raise RunStopped(self.stopped)
-                if finish == 'tool_calls':
-                    calls = message.get('tool_calls')
-                    if not body.get('tools') or not isinstance(calls, list) or not calls:
-                        raise ModelResponseError('接口返回未授权或空的工具调用')
-                    content = []
+                # 部分兼容服务以 stop 标记完整工具消息；仍按同一工具契约处理。
+                # length / content_filter 等明确未完成或被拒绝的结果不得进入工具执行。
+                if finish == 'tool_calls' or finish == 'stop' and message.tool_calls:
+                    calls = message.tool_calls
+                    if not calls or any(not isinstance(call, ChatCompletionMessageFunctionToolCall)
+                            or not isinstance(call.id, str) or not call.id
+                            or not isinstance(call.function.name, str) or not call.function.name
+                            or not isinstance(call.function.arguments, str) for call in calls):
+                        raise ModelDeliveryError('接口未返回完整的原生函数调用，原回执已保存')
+                    if len({call.id for call in calls}) != len(calls):
+                        raise ModelDeliveryError('接口返回重复工具调用身份，原回执已保存')
+                    from tools.JsonRepair import parse_arguments
+                    original_calls = [FunctionCall(id=call.id, name=call.function.name,
+                                                   arguments=call.function.arguments) for call in calls]
+                    content, errors = [], {}
                     for call in calls:
-                        function = call['function']
-                        if (call.get('type') != 'function' or not all(isinstance(v, str) and v.strip()
-                                for v in (call['id'], function['name'], function['arguments']))):
-                            raise ModelResponseError('工具调用结构非法，未执行')
-                        content.append(FunctionCall(id=call['id'], name=function['name'], arguments=function['arguments']))
-                    if len({call.id for call in content}) != len(content):
-                        raise ModelResponseError('工具调用编号重复，未执行')
-                elif finish != 'stop' or not isinstance(content, str) or not content.strip():
-                    raise ModelResponseError(f'接口未返回完整文本：finish_reason={finish}')
-                usage = payload.get('usage') or {}
+                        # AutoGen 0.7.5 only catches JSONDecodeError. Normalize
+                        # transport wrappers/escapes, then use our strict reader
+                        # before SDK dispatch: duplicate keys cannot be silently replaced,
+                        # and deep nesting/oversized integers must not escape its
+                        # tool task and leave the streaming queue waiting forever.
+                        try:
+                            arguments = parse_arguments(call.function.arguments)
+                        except ValueError as exc:
+                            errors[call.id] = (
+                                f'工具 {call.function.name[:80]!r}（call_id={call.id[:80]!r}）'
+                                f'参数不是无歧义 JSON 对象：{str(exc)[:300]}；原回执已保存'
+                            )
+                            continue
+                        # Dispatch the validated representation, not its original
+                        # envelope (e.g. a permitted UTF-8 BOM). The ledger retains
+                        # the exact raw response; SDK replay receives stable JSON.
+                        content.append(FunctionCall(id=call.id, name=call.function.name,
+                                                    arguments=encode(arguments, compact=True)))
+                    if errors:
+                        # Preserve every call, including valid peers, so the next
+                        # conversation has matched native tool errors and no
+                        # partially dispatched read batch. Reasoning remains
+                        # protocol metadata, never part of the error prose.
+                        raise ModelDeliveryError('；'.join(errors.values()), calls=original_calls,
+                                                 errors=errors, thought=thought)
+                    finish = 'function_calls'
+                elif finish != 'stop' or message.tool_calls or not isinstance(content, str) or not content.strip():
+                    raise ModelDeliveryError(f'接口未返回完整文本或工具调用：finish_reason={finish}')
+                usage = receipt_usage(payload)
+                # SDK 计数仅接受有效整数；账本仍保留原值，不将未知费用记为实际零费用。
+                if not usage_counts_valid(usage):
+                    usage = {}
                 prompt, completion = usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0)
-                if type(prompt) is not int or type(completion) is not int or min(prompt, completion) < 0:
-                    raise ModelResponseError('接口 token 用量非法')
-            except (ValueError, KeyError, TypeError, IndexError) as exc:
-                raise ModelResponseError('接口响应结构不合法，原文已保存') from exc
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+                raise ModelDeliveryError('接口响应结构不合法，原文已保存') from exc
             if not replay:
                 self.usage.prompt_tokens += prompt
                 self.usage.completion_tokens += completion
-            return CreateResult(content=content, finish_reason='function_calls' if finish == 'tool_calls' else finish,
+            return CreateResult(content=content, finish_reason=finish,
                                 usage=RequestUsage(prompt, completion), cached=replay, thought=thought)
         raise AssertionError('不可达的请求分支')
 
@@ -215,7 +340,10 @@ class ModelClient(ChatCompletionClient):
         yield  # 保持 AutoGen 的异步生成器接口。
 
     async def close(self):
-        """网络连接由每次请求的上下文管理器关闭。"""
+        """工作流退出时释放本次运行的连接池。"""
+        if self._sdk is not None:
+            await self._sdk.close()
+            self._sdk = None
 
     def actual_usage(self):
         return self.usage

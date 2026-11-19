@@ -9,12 +9,15 @@
 !/model/config.example.json
 !/agents/**/*.py
 !/common/**/*.py
-!/contract/**/*.py
-!/exporters/**/*.py
+!/execution/**/*.py
+!/inputs/**/*.py
+!/simulation/**/*.py
+!/narration/**/*.py
 !/model/**/*.py
 !/storage/**/*.py
 !/workflows/**/*.py
-!/prompts/*.md
+!/tools/**/*.py
+!/prompts/**/*.md
 !/README.md
 !/LICENSES/*.txt
 

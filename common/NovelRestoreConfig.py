@@ -1,6 +1,4 @@
 """显式配置模拟参数；路径相对于配置文件解析，不读取模型密钥。"""
-import json
-import math
 import re
 from pathlib import Path
 from typing import Literal
@@ -8,15 +6,18 @@ from unicodedata import normalize
 
 from pydantic import Field, field_validator, model_validator
 
-from common.NovelRestoreSchema import ActionMode, Identity, PositiveInt, Record
+from common.NovelRestoreSchema import Identity, PositiveInt, Record, SemanticPayload
+from tools.JsonInput import loads, validate
 
 
 class ExecutionConfig(Record):
     backend: Literal["model", "scripted"] = "model"
+    scripted_protocol: Literal["records"] = "records"
     model_config_path: Path | None = None
     script_file: Path | None = None
     max_calls: PositiveInt | None = None
     format_repairs: int = Field(default=2, ge=0, strict=True)
+    supervisor_turns: int = Field(default=2, ge=0, strict=True)
     concurrency: PositiveInt = 4
     max_request_chars: int = Field(default=0, ge=0, strict=True)
     max_tokens: PositiveInt | None = None
@@ -26,7 +27,7 @@ class ExecutionConfig(Record):
     @classmethod
     def load(cls, path):
         path = Path(path).expanduser().resolve()
-        config = cls.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        config = validate(cls, loads(path.read_bytes(), location=str(path)), location=str(path))
         resolved = {}
         for name, value in config:
             if isinstance(value, Path):
@@ -36,8 +37,8 @@ class ExecutionConfig(Record):
 
     def check_execution(self):
         path = self.model_config_path if self.backend == "model" else self.script_file
-        if self.max_calls is None or path is None or not path.is_file():
-            raise ValueError("执行任务必须提供 max_calls 及对应后端的有效配置文件")
+        if (self.max_calls is None and "max_calls" not in self.model_fields_set) or path is None or not path.is_file():
+            raise ValueError("执行任务必须显式提供 max_calls（正整数或 null）及对应后端的有效配置文件")
 
 
 # 版本设置只能表达呈现方式，不能提供另一份可被写作者读取的故事正文。
@@ -80,7 +81,7 @@ class VersionSpec(Record):
 class NovelRestoreNarrativeConfig(ExecutionConfig):
     version_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
     requirements: Identity = "保持故事事实"
-    max_calls: PositiveInt
+    max_calls: PositiveInt | None
     window: int = Field(default=5, ge=0, strict=True)
     max_revisions: int = Field(default=2, ge=0, strict=True)
     max_review_rounds: int = Field(default=2, ge=0, strict=True)
@@ -118,7 +119,7 @@ class BranchOpportunity(Record):
     source_ids: list[Identity] = Field(min_length=1, max_length=6)
 
 
-class BranchDecision(Record):
+class BranchDecision(SemanticPayload):
     reason: str = Field(min_length=1, max_length=600)
     alternatives: list[BranchOpportunity] = Field(description="继续当前线时留空，分叉时给出至少两种有依据的机会")
 
@@ -132,29 +133,20 @@ class NovelRestoreConfig(ExecutionConfig):
     branch_parallelism: PositiveInt = 2
     max_rounds: PositiveInt = 100
     seed: int = Field(default=0, strict=True)
-    character_action_ratios: dict[str, dict[ActionMode, float]] = Field(default_factory=dict)
-    action_ratios: dict[ActionMode, float] = Field(default_factory=lambda: {
-        "action": 0.4, "talk": 0.3, "think": 0.2, "idle": 0.1,
-    })
+    plan_candidates: int = Field(default=3, ge=1, le=8, strict=True)
+    plan_steps: int = Field(default=4, ge=1, le=12, strict=True)  # 旧配置可读；连贯行为不使用步骤配额。
     recent_memories: int = Field(default=5, ge=0, strict=True)
     related_memories: int = Field(default=10, ge=0, strict=True)
     # 旧模拟配置可读；实际写作使用叙述版本自己的 window 和 requirements。
     narrative_window: int = Field(default=5, ge=0, strict=True)
     narrative_requirements: str = ""
-    stagnation_rounds: PositiveInt = 3
+    goal_stagnation_batches: PositiveInt = 3
+    goal_progress_window: PositiveInt = 3
+    max_blocked_replans: PositiveInt = 2
     memory_candidates: PositiveInt = 40
-    summary_interval: PositiveInt = 5
+    summary_interval: PositiveInt = 5  # 旧配置可读；摘要只由显式按需任务触发。
     max_world_lookups: PositiveInt = 8
-
-    @model_validator(mode="after")
-    def valid_ratios(self):
-        for ratios in [self.action_ratios, *self.character_action_ratios.values()]:
-            if set(ratios) != {"action", "talk", "think", "idle"}:
-                raise ValueError("行动比例必须明确提供 action/talk/think/idle 四种比例")
-            values = ratios.values()
-            if any(not math.isfinite(value) or value < 0 for value in values) or not math.isclose(sum(values), 1, abs_tol=1e-9):
-                raise ValueError("行动比例必须非负、有限且总和为 1")
-        return self
+    max_personal_lookups: int = Field(default=2, ge=0, le=8, strict=True)
 
     def check_paths(self):
         if not (self.repository.is_file() or self.repository.is_dir()):

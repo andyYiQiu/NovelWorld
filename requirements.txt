@@ -1,5 +1,15 @@
 # Python 3.11+
 autogen-agentchat==0.7.5
 autogen-core==0.7.5
+autogen-ext[openai]==0.7.5
+openai==1.109.1
 httpx==0.28.1
 pydantic==2.13.5
+json5==0.17.3
+json-repair==0.64.9
+rank-bm25==0.2.2
+jieba==0.42.1
+stopwordsiso==0.6.1
+numpy==2.2.6
+jsonpatch==1.33
+jsonpointer==3.0.0

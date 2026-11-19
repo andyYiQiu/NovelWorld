@@ -5,8 +5,8 @@ from typing import Annotated, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, JsonValue, field_validator, model_serializer, model_validator
 
-from contract.NovelWorldStateSchema import AssetState, StateDelta
-from contract.NovelWorldState import public_state
+from inputs.NovelWorldStateSchema import AssetState, StateDelta, normalize_snapshot
+from inputs.NovelWorldState import public_state
 
 
 Identity = Annotated[str, Field(min_length=1)]
@@ -16,6 +16,14 @@ ActionMode = Literal["action", "talk", "think", "idle"]
 
 class Record(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class SemanticPayload(Record):
+    """Explicit opt-in for content-only tasks with no persistent record assembly.
+
+    Storage records must use a task contract instead. This marker never changes
+    validation or adds model calls.
+    """
 
 
 class WorldState(AssetState):
@@ -34,7 +42,7 @@ class WorldState(AssetState):
     @classmethod
     def snapshot_envelope(cls, value):
         # AssetState 会剥离这两个节点字段，而运行中的 WorldState 需要保留它们。
-        return value
+        return normalize_snapshot(value)
 
     @model_serializer(mode="wrap")
     def without_evidence(self, handler):
@@ -94,7 +102,7 @@ class MemoryContent(Record):
     occurred_at: str | None = None
     source_action_id: Identity | None = None
     source_shared_id: Identity | None = None
-    perceived_ids: list[Identity] = Field(default_factory=list, description="本次个人体验中的对象编号；不要求对应真实实体")
+    perceived_ids: list[Identity] = Field(default_factory=list, description="只填写对应的当次个人体验里出现的 perceived_id")
 
 
 class MemoryContribution(MemoryContent):
@@ -116,7 +124,7 @@ class MemoryRecord(MemoryContribution):
 
 
 class PerceivedObject(Record):
-    perceived_id: Identity
+    perceived_id: Identity = Field(description="本份个人视图内唯一的局部编号，与 correspondences 一一对应；不填真实资产编号。人物或身份未定对象使用 p1 至 p999999 的中性编号，不带前导0")
     description: Identity
 
 
@@ -126,9 +134,10 @@ class PersonalPerception(Record):
 
 
 class Correspondence(Record):
-    perceived_id: Identity
+    perceived_id: Identity = Field(description="与 personal.objects 对应的局部编号；解析已有行动目标时原样沿用目标编号，不创建新编号")
     actual_kind: Literal["role", "object", "location", "none", "unknown"]
-    actual_id: Identity | None = None
+    actual_id: Identity | None = Field(default=None,
+        description="actual_kind 为 role/object/location 时须填对应目录的真实编号；none/unknown 时必须为 null。只供世界使用")
     basis: Identity = Field(description="世界侧依据：当前条件如何产生此个人体验；不得交给人物")
 
     @model_validator(mode="after")
@@ -141,7 +150,8 @@ class Correspondence(Record):
 class WorldPerception(Record):
     """个人可读体验与世界私有对应关系；保存时绑定人物、行动及版本。"""
     personal: PersonalPerception
-    correspondences: list[Correspondence] = Field(default_factory=list)
+    correspondences: list[Correspondence] = Field(default_factory=list,
+        description="与 personal.objects 按 perceived_id 恰好一一对应；两边均不得重复、漏项或多项，不靠新增经历补齐映射")
 
     @model_validator(mode="after")
     def complete_mapping(self):
@@ -157,18 +167,19 @@ class WorldPerception(Record):
 
 
 class PerceptionBatch(Record):
-    views: dict[Identity, WorldPerception]
+    views: dict[Identity, WorldPerception] = Field(description="以本批选中人物的真实编号为键，须恰好覆盖这些人物；每份内容只包含该人的实际感知")
 
 
 class StateFactEvidence(Record):
-    path: Identity = Field(description="当前实际状态 current_state 的 JSON Pointer，例如 /characters/人物编号/life_status")
+    path: Identity = Field(pattern=r"^/(?:[^~]|~[01])*$",
+        description="相对于 current_state 根的 JSON Pointer，如 /characters/R1/life_status；不带 /current_state 前缀。字段名内 / 写为 ~1、~ 写为 ~0；数组用从0开始的下标")
     value: JsonValue = Field(description="该路径上的实际值；不得填写目标或未来参考状态的值")
 
 
 class ResultEvidence(Record):
     result_index: Annotated[int, Field(ge=0, strict=True)] = Field(description="对应 achieved_results 的从 0 开始的下标")
-    action_ids: list[Identity] = Field(default_factory=list, description="本组已发生或本批已裁定的行动编号")
-    state_facts: list[StateFactEvidence] = Field(default_factory=list, description="当前实际状态中的路径及实际值")
+    action_ids: list[Identity] = Field(default_factory=list, description="本组已发生或本批已裁定的行动编号，不得重复；与 state_facts 至少一项非空")
+    state_facts: list[StateFactEvidence] = Field(default_factory=list, description="当前实际状态中的路径及实际值；与 action_ids 至少一项非空")
 
     @model_validator(mode="after")
     def has_source(self):
@@ -178,11 +189,11 @@ class ResultEvidence(Record):
 
 
 class CompletionJudgment(Record):
-    achieved: bool = Field(strict=True)
+    achieved: bool = Field(strict=True, description="true 须有 achieved_results 且 remaining 为空；false 须用 remaining 明确尚未满足的要求")
     summary: Identity
     achieved_results: list[Identity] = Field(default_factory=list)
     result_evidence: list[ResultEvidence] = Field(default_factory=list,
-        description="逐项为 achieved_results 提供实际行动或当前状态依据；不得引用目标快照")
+        description="每项 achieved_results 恰好一条，result_index 为 0..n-1 且不重复；不得引用目标快照。确认事件完成须引用本事件实际行动")
     remaining: list[Identity] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -195,8 +206,8 @@ class CompletionJudgment(Record):
 
 
 class GroupAssessment(CompletionJudgment):
-    continuity_ok: bool = Field(strict=True)
-    contradictions: list[Identity] = Field(default_factory=list)
+    continuity_ok: bool = Field(strict=True, description="确认 achieved=true 时必须为 true")
+    contradictions: list[Identity] = Field(default_factory=list, description="关键事实或后续承接矛盾；非空时不能确认 achieved=true")
 
     @model_validator(mode="after")
     def safe_continuation(self):
@@ -206,9 +217,29 @@ class GroupAssessment(CompletionJudgment):
 
 
 class Need(Record):
-    urgency: Annotated[float, Field(ge=0, le=10)]
+    urgency: Identity = Field(description="本人依据当前体验表达的紧迫感，不是数值评分或统一刻度。")
     description: Identity
-    drift_per_hour: Annotated[float, Field(ge=-10, le=10)] = 0
+
+
+class PlanStep(Record):
+    description: Identity
+    status: Literal["pending", "completed"] = "pending"
+
+
+class ShortPlan(Record):
+    purpose: Identity
+    steps: list[PlanStep] = Field(min_length=1)
+    next_step: Annotated[int, Field(ge=0, strict=True)] = 0
+    status: Literal["active", "completed", "blocked", "abandoned"] = "active"
+    feedback: str = Field(default="", description="本人依据实际感知解释继续、完成、阻塞、调整或放弃；不等于客观成功。")
+
+    @model_validator(mode="after")
+    def valid_step(self):
+        if self.next_step >= len(self.steps):
+            raise ValueError("下一步须引用本计划实际存在的步骤")
+        if self.status == "active" and self.steps[self.next_step].status == "completed":
+            raise ValueError("仍在执行的下一步不能已经标记完成；重试应说明新理由并列为待办")
+        return self
 
 
 class CognitiveEffect(Record):
@@ -223,7 +254,7 @@ class PersonRuntime(Record):
     """世界掌握的能力与认知条件，不能作为人物自我介绍。"""
     can_act: bool = True
     body: str = ""
-    effects: list[CognitiveEffect] = Field(default_factory=list)
+    effects: list[CognitiveEffect] = Field(default_factory=list, description="此人的认知作用；effect_id 在本人列表中不得重复，不能引用他人的作用")
 
     @model_validator(mode="after")
     def unique_effects(self):
@@ -235,18 +266,31 @@ class PersonRuntime(Record):
 class RuntimeChange(Record):
     state: PersonRuntime
     basis: Identity
-    source_action_ids: list[Identity] = Field(default_factory=list)
+    source_action_ids: list[Identity] = Field(default_factory=list, description="本批真实行动编号；若由自然时间经过产生，留空并在 basis 说明实际依据")
 
 
-class ProcessingTrace(Record):
-    stage: Literal["perception", "execution", "encoding", "retrieval"]
-    effect_ids: list[Identity] = Field(min_length=1)
-    source_ids: list[Identity] = Field(default_factory=list)
+class ProcessingContent(Record):
+    effect_ids: list[Identity] = Field(min_length=1, description="引用此人已生效且 stage 一致的认知作用；不能用本批刚生成的作用倒推此前处理")
+    source_ids: list[Identity] = Field(default_factory=list, description="本次处理来源编号；执行偏差须引用本批人物行动，其他阶段引用当前任务提供的体验或记忆来源")
     explanation: Identity
+
+    @model_validator(mode="before")
+    @classmethod
+    def program_stage(cls, value):
+        # Content delivery never controls this metadata. Persistent traces still
+        # validate their own declared stage, including when historical data is read.
+        if "stage" not in cls.model_fields and isinstance(value, dict):
+            return {key: item for key, item in value.items() if key != "stage"}
+        return value
+
+
+class ProcessingTrace(ProcessingContent):
+    stage: Literal["perception", "execution", "encoding", "retrieval"]
 
 
 class FeltNeed(Record):
     description: Identity
+    urgency: str = ""
 
 
 class StoryState(Record):
@@ -254,7 +298,9 @@ class StoryState(Record):
     emotion: str = ""
     beliefs: list[Identity] = Field(default_factory=list)
     goals: list[Identity] = Field(default_factory=list)
-    plan: list[Identity] = Field(default_factory=list)
+    intention: str = Field(default="", description="本人当前目的及打算；依实际体验改变，不是待自动执行的步骤表。")
+    plan: list[Identity] = Field(default_factory=list, description="旧运行的历史打算，只读取证。")
+    short_plan: ShortPlan | None = None
 
 
 class CharacterState(StoryState):
@@ -262,12 +308,18 @@ class CharacterState(StoryState):
 
     def story_state(self):
         return StoryState(**self.model_dump(exclude={"needs"}),
-                          needs={key: FeltNeed(description=need.description) for key, need in self.needs.items()})
+                          needs={key: FeltNeed(description=need.description, urgency=need.urgency) for key, need in self.needs.items()})
+
+    @classmethod
+    def story_state_from_context(cls, context):
+        """只取行动者作决定时获准使用的心理，不从结果或后来的记忆推断。"""
+        value = context.get("working_state")
+        return cls.model_validate(value).story_state() if value is not None else None
 
 
-class MemorySummary(Record):
+class MemorySummary(SemanticPayload):
     text: Identity
-    memory_ids: list[Identity] = Field(min_length=1)
+    memory_ids: list[Identity] = Field(min_length=1, description="本人已保存、用于本次总结的记忆编号；不得引用他人记忆或行动编号")
 
 
 class CharacterSummary(MemorySummary):
@@ -296,16 +348,35 @@ class EnvironmentAttempt(Record):
 
 
 class InitialLocationChoice(Record):
-    location_id: Identity
+    location_id: Identity = Field(description="已有 repository 地点目录编号；不得创建地点编号或用地点名称代替")
     basis: Identity = Field(description="从已有资料选择地点的理由；属于下游补充而非原始已知事实")
     detail: str | None = None
 
 
+class OpportunityPlan(Record):
+    goal_ids: list[Identity] = Field(min_length=1, description="本次机会针对 goal_records 中哪些稳定目标；不新建验收目标。")
+    gap: Identity
+    scene_anchor: Identity = Field(description="一条已提交 action_id 或 /current_state 下具体状态属性的 JSON Pointer。"
+        "已知位置、引用等复合属性可整体引用，未知部分仍保留未知；不引用整个实体、目标或预测，不拼接多条路径或解释。")
+    perceivers: list[Identity] = Field(default_factory=list, description="按现场接触条件实际可能获得机会的人物；不代表已经知情。")
+    motive: Identity = Field(description="与此人已经有据的需要、信念、短计划或承诺如何相容；环境机会说明无需人物动机的依据。")
+    possible_responses: list[Identity] = Field(min_length=1, description="几种合理回应及各自可能改善或损害什么；均为预测。")
+    alternatives: list[Identity] = Field(default_factory=list, description="比较过的其他合法机会及取舍；不得伪造依据。")
+    expected_contribution: Identity
+    risk: Identity
+    stop_before: Identity
+    change_from_previous: Identity = Field(description="上次安排和实际反馈之后，本次具体改变什么；首次说明这是首次机会。")
+    path_status: Literal["viable", "exploring", "no_known_path"] = "viable"
+
+
 class RoundSchedule(Record):
-    actors: dict[Identity, Identity | None]
-    arrangements: dict[Identity, EnvironmentAttempt] = Field(default_factory=dict)
+    actors: dict[Identity, Identity | None] = Field(description="键为当前活跃事件编号，值为该事件的一位可行动参与人物编号；环境推进填 null。不得填写行动正文，同一人物本批不能重复指派")
+    arrangements: dict[Identity, EnvironmentAttempt] = Field(default_factory=dict,
+        description="键须恰好为 actors 中值为 null 的事件编号；人物行动事件不能同时填写环境尝试")
     initial_locations: dict[Identity, InitialLocationChoice] = Field(default_factory=dict,
         description="仅为本组活跃事件中当前位置未知的参与人物补充初始地点；不是移动或已经发生的动作")
+    opportunities: dict[Identity, OpportunityPlan] = Field(description="恰好覆盖 actors 的事件键；世界机会预测仅留后台，不能作为人物输入或实际因果证据。")
+    scene_decisions: dict[Identity, "SceneDecision"] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def explicit_environment(self):
@@ -323,7 +394,7 @@ class SceneDecision(Record):
 
 
 class ReplanSchedule(RoundSchedule):
-    scene_decisions: dict[Identity, SceneDecision]
+    scene_decisions: dict[Identity, SceneDecision] = Field(description="键须恰好覆盖当前全部活跃事件编号；每项比较该事件最后一次已提交行动")
 
 
 class CharacterMemories(Record):
@@ -331,10 +402,30 @@ class CharacterMemories(Record):
     working_state: CharacterState
 
 
-class MemoryApproval(Record):
+class NarrativePlanReview(Record):
     approved: bool = Field(strict=True)
     issues: list[Identity] = Field(default_factory=list)
-    character_issues: dict[Identity, list[Identity]] = Field(default_factory=dict)
+    repair_scope: Literal["all", "chapters", "links"] = Field(default="all",
+        description="仅所有问题都局限于指定章节时选 chapters；仅关联问题选 links；大纲、篇幅分配或无法定位时选 all。")
+    chapter_ids: list[Identity] = Field(default_factory=list,
+        description="chapters 返修须列出全部受影响章节；其余范围留空。不能通过缩小范围漏掉问题。")
+
+    @model_validator(mode="after")
+    def consistent(self):
+        if self.approved == bool(self.issues):
+            raise ValueError("通过不得有未决问题；拒绝须说明具体问题")
+        if len(self.chapter_ids) != len(set(self.chapter_ids)):
+            raise ValueError("返修章节不得重复")
+        if not self.approved and (self.repair_scope == "chapters") != bool(self.chapter_ids):
+            raise ValueError("仅章节返修须列出非空章节编号，其他范围不能夹带章节")
+        return self
+
+
+class MemoryApproval(Record):
+    approved: bool = Field(strict=True, description="通过时 issues 及各人的 character_issues 都须为空；拒绝时 issues 至少一项")
+    issues: list[Identity] = Field(default_factory=list, description="需要修复的具体问题；approved=false 时必填，不把已接纳疑点列作错误")
+    character_issues: dict[Identity, list[Identity]] = Field(default_factory=dict,
+        description="以受影响人物编号定位返修问题；通过时各列表必须为空")
     notes: list[Identity] = Field(default_factory=list, description="仅世界可见的审核依据或已接纳主观疑点；不作为未决错误")
 
     @model_validator(mode="after")
@@ -347,8 +438,8 @@ class MemoryApproval(Record):
 
 
 class UnknownTargetReview(Record):
-    approved: bool = Field(strict=True)
-    issues: list[Identity] = Field(default_factory=list)
+    approved: bool = Field(strict=True, description="通过时 issues 为空，拒绝时 issues 至少一项")
+    issues: list[Identity] = Field(default_factory=list, description="需要修复的具体问题；approved=false 时必填")
     basis: Identity = Field(description="依据实际局面解释结果是否依赖未知对象的身份或存在")
 
     @model_validator(mode="after")
@@ -361,7 +452,7 @@ class UnknownTargetReview(Record):
 class WorldResolution(Record):
     result: Identity
     state_patch: StatePatch = Field(default_factory=StatePatch)
-    observations: dict[Identity, WorldPerception]
+    observations: dict[Identity, WorldPerception] = Field(description="以实际获得本次体验的人物编号为键，须包含行动者本人；私有思考不能向其他人反馈")
 
 
 class ResolvedIntent(WorldResolution):
@@ -387,25 +478,52 @@ class WaveAdvance(Record):
     runtime_changes: dict[Identity, RuntimeChange] = Field(default_factory=dict)
     new_objects: dict[Identity, SimulatedObject] = Field(default_factory=dict,
         description="本批登记的普通道具；编号以 SIM_OBJ_ 开头且未使用。先复用上游及已有下游物品；对应状态须在本批物品补丁保存。不是额外的环境发生。")
-    processing: list[ProcessingTrace] = Field(default_factory=list)
+    processing: list[ProcessingTrace] = Field(default_factory=list,
+        description="本批执行偏差依据：stage 只能为 execution，source_ids 非空且引用本批行动，effect_ids 引用对应行动者在前态已生效的 execution 作用")
     basis: Identity
-    result: str = ""
-    observations: dict[Identity, WorldPerception] = Field(default_factory=dict)
+    result: str = Field(default="", description="共享经过的实际故事内容；observations 非空时必须填写。为空表示没有共享故事材料，此时 related_event_ids 须为空")
+    observations: dict[Identity, WorldPerception] = Field(default_factory=dict,
+        description="以实际感知共享经过的人物编号为键；有反馈时 result 必须保存共享经过")
     related_event_ids: list[Identity] = Field(default_factory=list,
-        description="自然变化与哪些本组事件有关；不将变化默认归入第一个事件")
+        description="自然变化相关的本组事件编号，不得重复；不将变化默认归入第一个事件。result 为空时必须为空")
 
 
 class WaveResolution(Record):
     actions: list[ResolvedIntent] = Field(min_length=1)
     advance: WaveAdvance
     final_views: dict[Identity, WorldPerception] = Field(default_factory=dict,
-        description="同一人物本批有多份不同体验时的统一当前视图；各项体验仍分别保留")
+        description="以本批有体验的人物编号为键；同一人物有多份不同体验时必须给统一当前视图，各项原体验分别保留")
+
+
+class GoalUpdate(Record):
+    status: Literal["satisfied", "unsatisfied", "unknown"]
+    change: Literal["improved", "regressed", "unchanged"]
+    explanation: Identity
+    action_ids: list[Identity] = Field(default_factory=list)
+    state_facts: list[StateFactEvidence] = Field(default_factory=list)
+    before_facts: list[StateFactEvidence] = Field(default_factory=list, description="批前实际状态；变化必须有实际行动或前后证据，不能引用目标快照。")
+    exploration_gain: list[Identity] = Field(default_factory=list, description="实际解决的未知或证伪的路径；与条件改善分列，不能抵消退步或清零停滞。")
+    blocker: Identity
+    failure_kind: Literal["none", "not_perceived", "not_believed", "conditions_missing", "needs_conflict", "execution_failed", "unknown"]
+    intermediate_conditions: list[Identity] = Field(default_factory=list, description="可调整的规划假设，不是新硬目标。")
+    alternative_paths: list[Identity] = Field(default_factory=list)
+    conflicts: list[Identity] = Field(default_factory=list, description="与其他稳定目标的已知冲突或待核实矛盾。")
+    next_change: Identity
+
+
+class SceneContinuation(Record):
+    actor: Identity
+    source_action_id: Identity = Field(description="本批该事件中，此人实际获得体验的行动；不能仅凭在场推定知情。")
+    reason: Identity = Field(description="当前实质问题仍未解决，为什么此人可以依据实际体验和本人动机直接接续；不预写其回答。")
+    stop_before: Identity = Field(description="下一段尝试的必要选择或回应停点；不限制普通动作数量或要求逐句确认。")
 
 
 class WaveAssessment(Record):
-    events: dict[Identity, CompletionJudgment]
+    events: dict[Identity, CompletionJudgment] = Field(description="以本批事件编号为键，须恰好覆盖本批全部事件")
     goal: GroupAssessment
-    made_progress: bool
+    goal_updates: dict[Identity, GoalUpdate] = Field(description="恰好覆盖 goal_records 全部稳定目标，同一候选后态逐项判断；未获机会与无效尝试由程序分别累计。")
+    scene_continuations: dict[Identity, SceneContinuation] = Field(default_factory=dict,
+        description="可在当前互动中直接接续的事件及人物；有新阻碍、需换场景、问题已有结果或无法确认时不填。不是人物行动或成功承诺。")
 
 
 class ActionProposal(Record):
@@ -413,16 +531,28 @@ class ActionProposal(Record):
     mode: ActionMode
     content: Identity
     target_ids: list[Identity] = Field(default_factory=list, description="当前个人感知中的对象编号；仅提出尝试，不宣布成功")
+    short_plan: ShortPlan | None = None
+    selection_reason: str = ""
+    purpose: str = ""
+    stop_before: str = Field(default="", description="本人预期需要重新决定或等待他人回应的位置。")
 
 
 class ActionCandidate(Record):
     proposal: ActionProposal
     expected_outcome: Identity
-    need_changes: dict[Identity, Annotated[float, Field(ge=-10, le=10)]] = Field(default_factory=dict)
+    tradeoffs: Identity = Field(description="本人预计的需要满足、时间资源代价、风险、未知条件与替代办法；不做数值评分。")
 
 
 class CharacterDecision(Record):
-    candidates: list[ActionCandidate] = Field(min_length=1, max_length=3)
+    candidates: list[ActionCandidate] = Field(min_length=1)
+    selected_index: Annotated[int, Field(ge=0, strict=True)]
+    selection_reason: Identity
+
+    @model_validator(mode="after")
+    def selected_candidate_exists(self):
+        if self.selected_index >= len(self.candidates):
+            raise ValueError("人物选定项须属于本次候选，不由程序改选")
+        return self
 
 
 class RecalledMemory(Record):
@@ -479,8 +609,12 @@ class Format17StoryMaterial(Record):
     working_states: dict[Identity, StoryState]
 
 
-class StoryMaterial(Format17StoryMaterial):
+class Format19StoryMaterial(Format17StoryMaterial):
     recollections_before: list[RecallExperience]
+
+
+class StoryMaterial(Format19StoryMaterial):
+    working_state_before: StoryState | None
 
 
 class SharedStoryMaterial(Record):
@@ -518,9 +652,11 @@ class ConfirmedAction(Record):
     working_states: dict[Identity, CharacterState] = Field(default_factory=dict)
 
     recollections_before: list[RecallExperience] = Field(default_factory=list)
+    working_state_before: StoryState | None = None
 
     def story_material(self):
         return StoryMaterial(action_id=self.action_id, position=self.position, recollections_before=self.recollections_before,
+            working_state_before=self.working_state_before,
             proposal=self.proposal if self.proposal.character_id is not None else None,
             result=self.result, perceptions_before={p: v.personal for p, v in self.views_before.items()},
             experiences={p: v.personal for p, v in self.observations.items()},
@@ -529,8 +665,8 @@ class ConfirmedAction(Record):
 
     @model_validator(mode="after")
     def matching_memories(self):
-        if self.recollections_before and self.proposal.character_id is None:
-            raise ValueError("仅人物行动可以携带行动前回想")
+        if self.proposal.character_id is None and (self.recollections_before or self.working_state_before is not None):
+            raise ValueError("仅人物行动可以携带行动前回想或心理")
         keys = [(row.character_id, row.memory_id) for row in self.memories]
         if len(set(keys)) != len(keys):
             raise ValueError("同一人物的记忆身份重复")
@@ -601,7 +737,11 @@ class Format17GroupDraft(Record):
     text: Identity
 
 
-class GroupDraft(Format17GroupDraft):
+class Format19GroupDraft(Format17GroupDraft):
+    materials: list[Format19StoryMaterial] = Field(min_length=1)
+
+
+class GroupDraft(Format19GroupDraft):
     materials: list[StoryMaterial] = Field(min_length=1)
 
 
@@ -634,10 +774,10 @@ class ChapterPlan(Record):
 class NarrativeLink(Record):
     link_id: Identity
     kind: Literal["foreshadow", "suspense", "echo", "retelling"]
-    from_fragment: Identity
-    to_fragment: Identity
+    from_fragment: Identity = Field(description="当前叙述计划中的片段编号，与 to_fragment 不同；foreshadow 的此端须在阅读顺序中更早")
+    to_fragment: Identity = Field(description="当前叙述计划中的另一片段编号，与 from_fragment 不同")
     content: Identity
-    acceptance: list[Identity] = Field(default_factory=list)
+    acceptance: list[Identity] = Field(default_factory=list, description="新交付叙述关联须给至少一条具体可核对的验收条件；不能只填写关系名")
 
 
 class NarrativeLayout(Record):
@@ -707,20 +847,20 @@ class ProseFragment(Record):
     text: Identity = Field(pattern=r"\S")
 
 
-class NarrativeAssignment(Record):
+class NarrativeAssignment(SemanticPayload):
     constraints: list[Identity] = Field(min_length=1)
     focus: Identity
 
 
 class NarrativeIssue(Record):
-    fragment_ids: list[Identity] = Field(min_length=1)
+    fragment_ids: list[Identity] = Field(min_length=1, description="问题涉及的当前实际片段编号；批次审核只定位本批目标，后续影响使用 affected_fragment_ids")
     description: Identity
 
 
 class NarrativeReview(Record):
-    approved: bool = Field(strict=True)
+    approved: bool = Field(strict=True, description="通过时 issues 必须为空；拒绝时至少一项具体问题并定位实际片段")
     summary: Identity
-    issues: list[NarrativeIssue] = Field(default_factory=list)
+    issues: list[NarrativeIssue] = Field(default_factory=list, description="approved=false 时至少一项，approved=true 时必须为空")
 
     @model_validator(mode="after")
     def consistent_verdict(self):
@@ -735,9 +875,11 @@ class LinkRemoval(Record):
 
 
 class NarrativeSelection(Record):
-    fragment_ids: list[Identity] = Field(min_length=1)
-    upsert_links: list[NarrativeLink] = Field(default_factory=list)
-    remove_links: list[LinkRemoval] = Field(default_factory=list)
+    fragment_ids: list[Identity] = Field(min_length=1, description="本批联合加工的既有片段编号，不得重复")
+    upsert_links: list[NarrativeLink] = Field(default_factory=list,
+        description="新增或更新的叙述关联；link_id 不得重复，也不得同时出现在 remove_links")
+    remove_links: list[LinkRemoval] = Field(default_factory=list,
+        description="删除的已有叙述关联及理由；link_id 不得重复，也不得同时出现在 upsert_links")
 
     @model_validator(mode="after")
     def unique_targets(self):
@@ -752,20 +894,39 @@ class NarrativeSelection(Record):
 class FragmentText(Record):
     fragment_id: Identity
     text: Identity = Field(pattern=r"\S")
-    summary: str = ""
+    summary: str = Field(default="", description="本次正文的非空摘要；新写作交付必须填写，不能只给正文")
     revealed: list[Identity] = Field(default_factory=list)
     change: Literal["initial", "wording", "meaning"] = Field(default="meaning",
         description="首写、仅措辞、已有内容的呈现或揭示变化；均不得增添或改写故事事实")
 
 
 class NarrativeBatchReview(NarrativeReview):
-    preserved_link_ids: list[Identity] = Field(default_factory=list)
-    affected_fragment_ids: list[Identity] = Field(default_factory=list)
+    preserved_link_ids: list[Identity] = Field(default_factory=list,
+        description="本批目标的直接关联中已核对保留的 link_id；两端都须有已有正文或本批候选正文，只有计划但未写正文的关联不能确认；不能顺带确认链上其他关系")
+    affected_fragment_ids: list[Identity] = Field(default_factory=list,
+        description="当前计划中需后续复核的其他片段编号；不能填本批目标或不存在的片段")
+
+    def validate_context(self, *, links, targets, written, reading_order):
+        """Tool delivery and persistence share the same contextual inputs."""
+        targets, written = set(targets), set(written)
+        if any(set(issue.fragment_ids) - targets for issue in self.issues):
+            raise ValueError("本批拒收问题须定位本批加工片段；后续影响使用 affected_fragment_ids")
+        for identity in self.preserved_link_ids:
+            if identity not in links:
+                raise ValueError("语义检查保留了未知关联：" + identity)
+            link = links[identity]["link"]
+            ends = {link["from_fragment"], link["to_fragment"]}
+            if not ends.intersection(targets):
+                raise ValueError("只能保留本批目标的直接关联，不能顺带确认链上其他关系")
+            if missing := ends - written:
+                raise ValueError(f"关联 {identity} 的片段 {sorted(missing)} 尚无正文；只能保留已读取正文的直接关联")
+        if set(self.affected_fragment_ids) - (set(reading_order) - targets):
+            raise ValueError("影响传播引用未知片段或当前目标")
 
 
 class NarrativeBatch(Record):
-    texts: list[FragmentText] = Field(min_length=1)
-    confirmed_link_ids: list[Identity] = Field(default_factory=list)
+    texts: list[FragmentText] = Field(min_length=1, description="本批每个联合目标片段恰好一份正文，不得重复或遗漏")
+    confirmed_link_ids: list[Identity] = Field(default_factory=list, description="本批已核对的实际叙述关联编号，不得重复")
 
     @model_validator(mode="after")
     def unique_items(self):

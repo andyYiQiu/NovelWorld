@@ -1,12 +1,13 @@
 """在树根单独比较完整叶时间轴，选定后仅在该叶创建并生成叙述版本。"""
+import asyncio
 from pathlib import Path
 
-from agents.NovelRestoreAgent import fingerprint, task_id
 from agents.NovelRestoreNarratorAgent import NovelRestoreNarratorAgent
 from common.NovelRestoreConfig import NovelRestoreNarrativeConfig
-from common.Runtime import RunStopped
+from common.Runtime import RunStopped, fingerprint, task_id
 from storage.NovelRestoreLog import NovelRestoreLog
-from storage.NovelRestoreStorage import NarrativeScope, NovelRestoreStorage
+from storage.NovelRestoreNarrativeStorage import NarrativeScope
+from storage.NovelRestoreStorage import NovelRestoreStorage
 from workflows.NovelRestoreBranches import branch_layout, tree_status
 from workflows.NovelRestoreWorkflow import NovelRestoreWorkflow
 
@@ -115,8 +116,8 @@ async def select_and_narrate(root_directory, candidate_directories, config):
                 if root.connection.execute("SELECT 1 FROM calls WHERE scope=? AND ended IS NULL",
                                            (scope.scope,)).fetchone():
                     raise RunStopped("上次择线请求尚无调用回执，无法确定送达结果")
-                executor, client = NovelRestoreWorkflow.executor(scope, backend, log)
-                narrator = NovelRestoreNarratorAgent(root, config.version_id, executor)
+                supervisor, client = NovelRestoreWorkflow.supervisor(scope, backend, log)
+                narrator = NovelRestoreNarratorAgent(root, config.version_id, supervisor)
                 choice = await narrator.choose_timeline(sources, config)
                 usage = root.usage(scope.scope)
                 usage["started"] = root.connection.execute(
@@ -125,6 +126,14 @@ async def select_and_narrate(root_directory, candidate_directories, config):
                            "source_hash": inputs[choice.branch]["source_hash"], "usage": usage}
                 state.update(stage="selected", branch=choice.branch, reason=choice.reason, receipt=receipt)
                 root.set_checkpoint(key, state)
+            except (asyncio.CancelledError, KeyboardInterrupt) as error:
+                reason = f"择线被中断（{type(error).__name__}）；已保存请求回执和分批阅读进度"
+                # 已选定的来源不能因退出时中断被改成尚未选择；恢复必须沿用原收据。
+                saved = root.get_checkpoint(key) or state
+                if not saved.get("branch"):
+                    root.set_checkpoint(key, {**saved, "stage": "paused", "error": reason})
+                log.write("selection_interrupted", version=config.version_id, error=reason)
+                raise
             except RunStopped as error:
                 root.set_checkpoint(key, {**state, "stage": "paused", "error": str(error)})
                 return 2, selection_status(root, config.version_id)
@@ -132,9 +141,7 @@ async def select_and_narrate(root_directory, candidate_directories, config):
                 root.set_checkpoint(key, {**state, "stage": "failed", "error": str(error)})
                 raise
             finally:
-                if client is not None:
-                    await client.close()
-                log.close()
+                await NovelRestoreWorkflow.close_execution(client, log, version=config.version_id)
         selected_directory = _selected_directory(root, state["branch"])
         receipt = state["receipt"]
         with NovelRestoreStorage(selected_directory, narration_only=True) as leaf:

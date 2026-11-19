@@ -1,7 +1,14 @@
 {
-  "repository": "../../repository/祝福_正式115",
+  "repository": "../../repository/BOOK_ID",
   "run_directory": "../../runs/example",
   "model_config_path": "../../model/config.example.json",
   "max_timelines": 4,
-  "max_calls": 1000
+  "max_calls": 1000,
+  "max_tokens": 8000000,
+  "supervisor_turns": 2,
+  "plan_candidates": 3,
+  "max_personal_lookups": 2,
+  "goal_stagnation_batches": 3,
+  "goal_progress_window": 3,
+  "max_blocked_replans": 2
 }

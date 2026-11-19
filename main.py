@@ -17,12 +17,17 @@ def main(argv=None):
     status = commands.add_parser("status", help="只读查看运行状态，不恢复或请求模型")
     status.add_argument("--run-directory", required=True)
     status.add_argument("--version", help="只读查看指定叙述版本")
+    summarize = commands.add_parser("summarize", help="按需整理指定已冻结组的人物历史；不推进模拟")
+    summarize.add_argument("--run-directory", required=True)
+    summarize.add_argument("--group-id", required=True)
     run = commands.add_parser("run", help="新建运行并模拟至事件组草稿时间轴")
     run.add_argument("--config", required=True)
     run.add_argument("--narrative-config", help="模拟完成后创建并生成指定叙述版本")
     resume = commands.add_parser("resume", help="继续已有模拟、叙述版本或重试文件导出")
     resume.add_argument("--run-directory", required=True)
     resume.add_argument("--version", help="继续指定叙述版本；省略时继续模拟")
+    resume.add_argument("--retry-unknown", action="store_true",
+                        help="显式重试模拟中尚无回执或已知连接未建立的请求；保留费用账目与已完成任务，不重演整轮")
     narrate = commands.add_parser("narrate", help="从完整模拟草稿新建叙述版本")
     narrate.add_argument("--run-directory", required=True)
     narrate.add_argument("--config", required=True)
@@ -35,7 +40,11 @@ def main(argv=None):
     fork.add_argument("--run-directory", required=True, help="已有运行目录")
     fork.add_argument("--config", required=True, help="新实验的模拟配置")
     fork.add_argument("--node", required=True, help="从来源运行已保存的该节点入口另开实验")
+    for command in (run, resume, narrate, summarize):
+        command.add_argument("--progress", action="store_true", help="向终端实时显示步骤、请求及回执用量；不输出模型正文")
     args = parser.parse_args(argv)
+    from storage.NovelRestoreLog import NovelRestoreLog
+    NovelRestoreLog.progress = getattr(args, "progress", False)
     try:
         if args.command in ("fork", "retry"):
             if args.command == "fork":
@@ -45,25 +54,30 @@ def main(argv=None):
                                                          preserve_progress=args.preserve_progress)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
-        if args.command in ("run", "resume", "narrate"):
+        if args.command in ("run", "resume", "narrate", "summarize"):
             from workflows.NovelRestoreWorkflow import NovelRestoreWorkflow
             from common.Runtime import JobFailed
             from model.ModelClient import ModelResponseError
             try:
-                if args.command == "narrate":
+                if args.command == "summarize":
+                    code, result = asyncio.run(NovelRestoreWorkflow.summarize(args.run_directory, args.group_id))
+                elif args.command == "narrate":
                     code, result = asyncio.run(NovelRestoreWorkflow.narrate(
                         args.run_directory, config=NovelRestoreNarrativeConfig.load(args.config)))
                 elif args.command == "resume" and args.version:
+                    if args.retry_unknown:
+                        raise ValueError("--retry-unknown 仅用于模拟续跑，不用于叙述版本")
                     code, result = asyncio.run(NovelRestoreWorkflow.narrate(args.run_directory, version_id=args.version))
                 else:
                     config = NovelRestoreConfig.load(args.config) if args.command == "run" else None
                     narrative = (NovelRestoreNarrativeConfig.load(args.narrative_config)
-                                 if args.command == "run" and args.narrative_config else None)
+                                 if config is not None and not config.stop_after_group and args.narrative_config else None)
                     if narrative is not None:
                         NovelRestoreWorkflow.execution_inputs(narrative)
                     code, result = asyncio.run(NovelRestoreWorkflow.run(
-                        config=config, directory=args.run_directory if args.command == "resume" else None))
-                    if narrative is not None and (code == 0 or any(
+                        config=config, directory=args.run_directory if args.command == "resume" else None,
+                        retry_unknown=args.command == "resume" and args.retry_unknown))
+                    if narrative is not None and (result["progress"]["stage"] == "simulation_complete" or any(
                             leaf["stage"] == "simulation_complete" for leaf in result.get("leaves", []))):
                         story_code, story = asyncio.run(NovelRestoreWorkflow.narrate(config.run_directory, config=narrative))
                         result = {"simulation": result, "narrative": story} if "leaves" in result else story

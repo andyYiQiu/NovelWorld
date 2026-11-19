@@ -8,8 +8,9 @@ import sqlite3
 
 from model.ModelClient import ModelClient
 from common.NovelRestoreConfig import Branch, BranchPlan
-from exporters.NovelRestoreExporter import NovelRestoreExporter
+from storage.NovelRestoreExporter import NovelRestoreExporter
 from storage.NovelRestoreStorage import NovelRestoreStorage
+from tools.RuntimeFiles import regular_opener
 
 
 def child_directory(parent, name):
@@ -96,7 +97,7 @@ def _child_limit(limit, used, count, index):
     return used + share + int(index < extra)
 
 
-async def explore(workflow, directory):
+async def explore(workflow, directory, *, retry_unknown=False):
     directory = Path(directory).resolve()
     with NovelRestoreStorage(directory, readonly=True) as run:
         workers = asyncio.Semaphore(run.config.branch_parallelism)
@@ -105,17 +106,19 @@ async def explore(workflow, directory):
 
     async def visit(path):
         async with workers:
-            code, result = await workflow._run_segment(directory=path, request_slots=request_slots)
+            options = {"retry_unknown": True} if retry_unknown else {}
+            code, result = await workflow._run_segment(directory=path, request_slots=request_slots, **options)
             if code or result["progress"]["stage"] != "branch_ready":
                 return
             with NovelRestoreStorage(path, readonly=True) as parent:
                 split = parent.get_checkpoint("branch_split")
                 config = parent.config
                 used_calls = parent.call_count("simulation")
-                used_tokens = parent.usage("simulation")["tokens"] if config.max_tokens is not None else 0
+                used_tokens = parent.usage("simulation")["budget_tokens"] if config.max_tokens is not None else 0
                 limit = config.max_calls
                 if config.backend == "model":
-                    limit = min(limit, ModelClient.read_config(config.model_config_path)["max_calls"])
+                    limit = min((n for n in (limit, ModelClient.read_config(config.model_config_path)["max_calls"])
+                                 if n is not None), default=None)
             if split is None:
                 raise ValueError("分支入口缺少本次运行已提交的决策")
             choices = split["alternatives"]
@@ -127,7 +130,7 @@ async def explore(workflow, directory):
                     dest = child_directory(path, name)
                     calls = _child_limit(limit, used_calls, len(choices), i)
                     tokens = _child_limit(config.max_tokens, used_tokens, len(choices), i)
-                    if calls <= used_calls or (tokens is not None and tokens <= used_tokens):
+                    if (calls is not None and calls <= used_calls) or (tokens is not None and tokens <= used_tokens):
                         raise ValueError("本分支没有剩余模拟预算")
                     seed = int.from_bytes(sha256(f"{config.seed}/{name}".encode()).digest()[:8], "big")
                     capacity = _child_limit(config.max_timelines, 0, len(choices), i)
@@ -145,7 +148,7 @@ async def explore(workflow, directory):
         except Exception as error:
             errors[str(path.relative_to(directory))] = str(error)
 
-    with (directory / ".branch-tree.lock").open("a+b") as lock:
+    with open(directory / ".branch-tree.lock", "a+b", opener=regular_opener) as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:

@@ -1,5 +1,4 @@
 """一个写入者；运行库原子保存客观与主观资料，个人文件为可恢复投影。"""
-from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import fcntl
@@ -7,38 +6,36 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 from urllib.parse import quote
 
-from common.NovelRestoreConfig import NovelRestoreConfig, NovelRestoreNarrativeConfig
-from common.NovelRestoreRepository import open_repository
+from common.NovelRestoreConfig import NovelRestoreConfig
+from tools.JsonInput import loads, validate
+from tools.RuntimeFiles import check_sqlite_files, regular_opener
+from inputs.NovelRestoreRepository import open_repository
 from common.NovelRestoreSchema import (
-    ConfirmedAction, EventDraft, Format17GroupDraft, GroupDraft, EventOutcome, NarrativeBatch, NarrativePlan, NarrativeReview, NarrativeSelection,
-    ProseFragment, WorldState, MemoryRecord, WorldPerception, RoundSchedule, ReplanSchedule, StatePatch,
+    ConfirmedAction, EventDraft, Format17GroupDraft, Format19GroupDraft, GroupDraft,
+    WorldState, MemoryRecord, WorldPerception, RoundSchedule, ReplanSchedule, StatePatch,
     SharedStoryMaterial,
 )
-from common.Runtime import RunStopped
-from common.NovelRestoreReview import require_review
-from common.NovelRestoreWorldState import apply_patch, sync_snapshot, validate_references
-from common.NovelRestoreStory import story_text
-from common.NovelRestoreObjects import effective_catalog
-from common.NovelRestoreSubjectiveWorld import MemoryCorruption, NovelRestoreSubjectiveWorld
-from storage.NovelRestoreRuntime import CALL_ROLE, NovelRestoreRuntime
+from common.Runtime import CALL_ROLE, RunStopped, fingerprint, storage_encode
+from execution.NovelRestoreReview import require_review
+from simulation.NovelRestoreWorldState import apply_patch, sync_snapshot, validate_references
+from simulation.NovelRestoreStory import story_text
+from simulation.NovelRestoreObjects import effective_catalog
+from simulation.NovelRestoreSubjectiveWorld import MemoryCorruption, NovelRestoreSubjectiveWorld
+from storage.NovelRestoreRuntime import NovelRestoreRuntime, _publish_fork
+from storage.NovelRestoreNarrativeStorage import NovelRestoreNarrativeStorage
 
 
-def encode(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
-class NarrativeLimitReached(RunStopped):
-    """正文实质修订已达上限，保留未完成结果。"""
-
-
-class NovelRestoreStorage(NovelRestoreRuntime):
-    FORMAT = 18
+class NovelRestoreStorage(NovelRestoreRuntime, NovelRestoreNarrativeStorage):
+    FORMAT = 23
 
     @classmethod
     def create(cls, config: NovelRestoreConfig):
+        if config.run_directory.expanduser().is_symlink():
+            raise ValueError("不能通过符号链接创建运行目录")
         config = config.model_copy(update={name: getattr(config, name).expanduser().resolve()
                                           for name in ("repository", "run_directory")})
         config.check_paths()
@@ -46,26 +43,16 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         with open_repository(config.repository) as repository:
             repository.validate_contract()
             catalog = {kind: list(repository.assets(kind)) for kind in repository.ASSET_KINDS}
-            if config.character_action_ratios.keys() - set(catalog["role"]):
-                raise ValueError("行动比例覆盖包含未知人物")
-            nodes, previous = [], None
+            # validate_contract 已逐组回放并检查引用、身份和跨节点连续性。
+            # 此处只投影运行目录；逐组重新求 before/after 会反复回放同一历史。
+            nodes = []
             for node in repository.nodes():
-                snapshot = repository.snapshot(node["node_id"])
-                if snapshot.previous_node_id != previous:
-                    raise ValueError("节点快照的前驱与故事顺序不一致")
-                validate_references(snapshot, catalog)
                 groups = []
                 for group in repository.groups(node["node_id"]):
                     events = {event["task_id"]: [p["role_code"] for p in event["participants"]]
                               for event in group.events}
-                    if any(set(people) - set(catalog["role"]) for people in events.values()):
-                        raise ValueError("事件参与者不在人物目录中")
-                    before, after = repository.group_states(group)
-                    validate_references(before, catalog)
-                    validate_references(after, catalog)
                     groups.append({"group_id": group.group_id, "order": group.order, "events": events, "event_ids": list(events)})
                 nodes.append({"node_id": node["node_id"], "order": node["order"], "groups": groups})
-                previous = node["node_id"]
             config.validate_branching()
             if config.stop_after_group and not any(
                     group["group_id"] == config.stop_after_group for node in nodes for group in node["groups"]):
@@ -73,8 +60,28 @@ class NovelRestoreStorage(NovelRestoreRuntime):
             run_id = uuid4().hex
             manifest = {"format": cls.FORMAT, "run_id": run_id, "branch_root_id": run_id, "source": repository.source,
                         "config": config.model_dump(mode="json"), "repository_hash": repository.fingerprint(),
-                        "catalog": catalog, "characters": repository.assets("role"), "nodes": nodes}
+                        "catalog": catalog, "characters": repository.assets("role"),
+                        "locations": repository.assets("location"), "nodes": nodes}
             state = sync_snapshot(None, repository.snapshot(nodes[0]["node_id"]))
+        directory = config.run_directory
+        if directory.exists():
+            raise FileExistsError("运行目录已存在，请保留已有目录：" + str(directory))
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        # 建库和初始投影成功前不暴露目标目录，初始化故障可用同名目录重试。
+        with TemporaryDirectory(prefix=".run-init-", dir=directory.parent) as temporary:
+            staged = Path(temporary) / "run"
+            staged_config = config.model_copy(update={"run_directory": staged})
+            staged_manifest = {**manifest, "config": staged_config.model_dump(mode="json")}
+            with cls._create_staged(staged_config, staged_manifest, state) as storage:
+                with storage.connection:
+                    storage.connection.execute("UPDATE runtime SET manifest=? WHERE singleton=1", (storage_encode(manifest),))
+            _publish_fork(staged, directory)
+        return cls(directory)
+
+    @classmethod
+    def _create_staged(cls, config, manifest, state):
+        """仅供 create 在自己的隔离目录内准备初始化文件。"""
+        catalog, nodes = manifest["catalog"], manifest["nodes"]
         progress = {"stage": "initialized", "node_id": None, "node_order": 0,
                     "group_order": 0, "last_action_id": None}
         directory = config.run_directory
@@ -112,20 +119,21 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                                        [(event, node["node_id"], group["order"]) for node in nodes
                                         for group in node["groups"] for event in group["events"]])
                 connection.execute("INSERT INTO runtime VALUES (1, ?, 0, ?, ?, NULL)",
-                                   (encode(manifest), state.model_dump_json(), encode(progress)))
+                                   (storage_encode(manifest), state.model_dump_json(), storage_encode(progress)))
                 connection.executemany("INSERT INTO checkpoints VALUES (?, ?)", [
-                    ("self_profiles", encode(manifest["characters"])),
-                    ("person_runtime", encode({p: {"can_act": True, "body": "", "effects": []}
+                    ("self_profiles", storage_encode({})),
+                    ("person_runtime", storage_encode({p: {"can_act": True, "body": "", "effects": []}
                                                for p in catalog["role"]})),
-                    ("story_seconds", encode(0)),
+                    ("story_seconds", storage_encode(0)),
                 ])
         finally:
             connection.close()
-        storage = cls(directory)
+        # 临时库尚不接收任务；正式发布后重新打开时统一核对 repository 指纹。
+        storage = cls(directory, narration_only=True)
         try:
             storage.publish_world()
             storage.publish_characters()
-        except Exception:
+        except BaseException:
             storage.close()
             raise
         return storage
@@ -134,14 +142,17 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         self.directory = Path(directory).expanduser().resolve()
         self.readonly = readonly
         self.connection = None
+        self._inflight_calls = set()
         self._json_repository = None
         self._lock = None
         try:
             database = self.directory / "run.sqlite3"
+            check_sqlite_files(database)
             if not database.is_file():
                 raise ValueError(f"运行数据库不存在：{database}")
             if not readonly:
-                self._lock = (self.directory / ".writer.lock").open("a+b")
+                self._lock = open(self.directory / ".writer.lock", "a+b",
+                                  opener=regular_opener)
                 try:
                     fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError as error:
@@ -155,15 +166,34 @@ class NovelRestoreStorage(NovelRestoreRuntime):
             else:
                 self.connection.execute("PRAGMA synchronous=FULL")
             row = self.connection.execute("SELECT manifest FROM runtime WHERE singleton=1").fetchone()
+            location = f"{database}:runtime[singleton=1].manifest"
             if row is None:
-                raise ValueError("运行初始化尚未完成，请保留现场并使用新的运行目录")
-            self.manifest = json.loads(row[0])
+                raise ValueError(f"{location}: 运行初始化尚未完成，请保留现场并使用新的运行目录")
+            self.manifest = loads(row[0], location=location)
+            # 只核对所有受支持格式共有的打开条件，不把当前格式的新字段强加给历史运行。
+            for key, kind in {"format": int, "config": dict, "run_id": str, "catalog": dict,
+                              "characters": dict, "nodes": list}.items():
+                if key not in self.manifest or type(self.manifest[key]) is not kind:
+                    raise ValueError(f"{location}/{key}: 运行记录缺少字段或字段类型错误，须为 {kind.__name__}")
+            if not self.manifest["run_id"].strip():
+                raise ValueError(f"{location}/run_id: 运行身份不能为空")
+            people = self.manifest["catalog"].get("role")
+            if not isinstance(people, list):
+                raise ValueError(f"{location}/catalog/role: 人物目录须为身份列表")
+            for index, person in enumerate(people):
+                if not isinstance(person, str) or not person.strip():
+                    raise ValueError(f"{location}/catalog/role/{index}: 人物身份须为非空文本")
             if self.manifest["format"] != self.FORMAT and not (readonly and self.manifest["format"] in range(1, self.FORMAT)):
-                raise ValueError("旧运行格式仅支持只读查看；请新建运行，不原地升级")
+                raise ValueError(f"{location}/format: 旧运行格式仅支持只读查看；请新建运行，不原地升级")
             saved_config = self.manifest["config"]
+            if self.manifest["format"] < 21:
+                # Historical manifests remain untouched; obsolete controls
+                # are removed only from the read-only configuration view.
+                saved_config = {k: v for k, v in saved_config.items()
+                                if k not in {"action_ratios", "character_action_ratios", "stagnation_rounds"}}
             if self.manifest["format"] < 17:
                 saved_config = {"max_timelines": 1, **saved_config}
-            self.config = NovelRestoreConfig.model_validate(saved_config)
+            self.config = validate(NovelRestoreConfig, saved_config, location=location + "/config")
             if not readonly and self.config.run_directory.resolve() != self.directory:
                 raise ValueError("运行目录与初始化绑定不一致，不能写入复制的运行")
             self.run_id = self.manifest["run_id"]
@@ -174,7 +204,7 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                     self._json_repository = open_repository(self.config.repository)
                 with self.read_repository() as repository:
                     self._check_repository(repository)
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -186,12 +216,14 @@ class NovelRestoreStorage(NovelRestoreRuntime):
 
     def close(self):
         self._json_repository = None
-        if self.connection is not None:
-            self.connection.close()
-            self.connection = None
-        if self._lock is not None:
-            self._lock.close()
-            self._lock = None
+        connection, self.connection = self.connection, None
+        lock, self._lock = self._lock, None
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            if lock is not None:
+                lock.close()
 
     def read_repository(self):
         """JSON 在本次写运行中复用启动快照；SQLite 保留独立只读事务。"""
@@ -235,7 +267,7 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         progress.update(stage="node_ready", node_id=node_id, node_order=next_node["order"], group_order=0)
         with self.connection:
             self.connection.execute("UPDATE runtime SET version=?,state=?,progress=?,group_state=NULL WHERE singleton=1",
-                                    (version + 1, state.model_dump_json(), encode(progress)))
+                                    (version + 1, state.model_dump_json(), storage_encode(progress)))
         self.publish_world()
         return version + 1
 
@@ -261,9 +293,11 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         progress.update(stage="group_ready", group_order=order)
         with self.connection:
             self.connection.execute("UPDATE runtime SET version=?,progress=?,state=?,group_state=? WHERE singleton=1",
-                                    (version + 1, encode(progress), state.model_dump_json(), reference.model_dump_json()))
+                                    (version + 1, storage_encode(progress), state.model_dump_json(), reference.model_dump_json()))
             self._put("checkpoints", "group_target", target.model_dump(mode="json"))
-            self._put("checkpoints", "group_clock", {"round": 1, "batch": 1, "stagnant": 0})
+            from simulation.NovelRestoreGoals import initial_goal_records
+            self._put("checkpoints", "group_clock", {"round": 1, "batch": 1})
+            self._put("checkpoints", "goal_records", initial_goal_records(group))
             self._put("checkpoints", "last_goal", None)
             self._put("checkpoints", "wave", None)
             self.connection.execute("UPDATE event_progress SET status='running' WHERE node_id=? AND group_order=?",
@@ -296,32 +330,36 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         if (group.node_id, group.order) != (progress["node_id"], progress["group_order"]) or clock != self.get_checkpoint("group_clock"):
             raise ValueError("行动机会或初始地点的依据已过期")
         payload = result.model_dump(mode="json")
-        if clock["stagnant"] >= self.config.stagnation_rounds:
+        from simulation.NovelRestoreGoals import goal_replan_required
+        replan = goal_replan_required(self.get_checkpoint("goal_records", {}), self.config.goal_stagnation_batches)
+        if replan:
             result = ReplanSchedule.model_validate(payload)
-            require_review(self, "schedule", payload)
         else:
             result = RoundSchedule.model_validate(payload)
         states = self.event_states()
+        active = {e["task_id"] for e in group.events if states[e["task_id"]]["status"] == "running"}
+        if any(set(getattr(result, field)) != active for field in ("actors", "opportunities", "scene_decisions")):
+            raise ValueError("调度、机会及现场安排必须恰好覆盖本组活跃事件")
+        require_review(self, "schedule", payload)
         people = {p["role_code"] for event in group.events if states[event["task_id"]]["status"] == "running"
                   for p in event["participants"]}
         changes, entries = [], []
         for person, choice in result.initial_locations.items():
             if person not in people or person not in state.characters:
                 raise ValueError("只能为本组活跃事件的参与人物补充初始地点")
-            previous = state.characters[person].location
-            if (previous.location.status != "unknown" or state.characters[person].life_status == "not_born"
+            previous = state.characters[person].position
+            if (previous.location_id is not None or state.characters[person].life_status == "not_born"
                     or choice.location_id not in self.manifest["catalog"]["location"]):
                 raise ValueError("初始地点只允许补充已登记地点与未知位置")
-            changes.append({"role_id": person, "set": {"location": {"location": {"status": "known",
-                "references": [{"type": "location", "id": choice.location_id}]}, "detail": choice.detail}},
+            changes.append({"role_id": person, "set": {"position": {"location_id": choice.location_id, "position_within_place": choice.detail}},
                 "basis": choice.basis})
             entries.append({"kind": "simulation_initial_location", "person": person, "node_id": group.node_id,
                 "group_id": group.group_id, "round": clock["round"], "location_id": choice.location_id,
                 "basis": choice.basis, "detail": choice.detail, "previous": previous.model_dump(mode="json")})
         if changes:
             state = apply_patch(state, StatePatch.model_validate({"characters": changes}))
-            validate_references(state, effective_catalog(self))
-        schedule = {**result.model_dump(mode="json"), "group_id": group.group_id, "round": clock["round"]}
+            validate_references(state, effective_catalog(self), locations=self.manifest["locations"])
+        schedule = {**result.model_dump(mode="json"), "group_id": group.group_id, "round": clock["round"], "replan": replan}
         with self.connection:
             if changes:
                 self.connection.execute("UPDATE runtime SET version=?,state=? WHERE singleton=1", (version + 1, state.model_dump_json()))
@@ -337,72 +375,51 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         if version != current or (group.node_id, group.order) != (progress["node_id"], progress["group_order"]):
             raise ValueError("事件组验收依据已过期")
         states = self.event_states()
-        if any(states[e["task_id"]]["status"] != "completed" for e in group.events):
+        if assessment.achieved and any(states[e["task_id"]]["status"] != "completed" for e in group.events):
             raise ValueError("全组事件完成后才能确认组后目标")
-        from common.NovelRestoreWorldState import validate_result_evidence
+        from simulation.NovelRestoreWorldState import validate_result_evidence
         actions = {a.action_id for event in group.events for a in self.event_actions(event["task_id"])}
         validate_result_evidence(assessment, state.model_dump(mode="json"), actions)
-        from common.NovelRestoreReview import require_review, group_delivery
+        from execution.NovelRestoreReview import group_delivery
         require_review(self, "group", group_delivery(self, group.group_id, assessment))
+        records = self.get_checkpoint("goal_records", {})
+        from simulation.NovelRestoreGoals import goals_satisfied
+        if assessment.achieved and not goals_satisfied(records):
+            raise ValueError("逐项目标尚未全部满足，不能以整体结论绕过未完成项")
         with self.connection:
             self._put("checkpoints", "group_assessment/" + group.group_id,
                       {"version": version, **assessment.model_dump(mode="json")})
             self._put("checkpoints", "last_goal", assessment.model_dump(mode="json"))
+            if assessment.achieved:
+                # 进入下一组会替换当前账本；通过时保留本组最终记录，
+                # 与验收同一事务保存，不进入人物或叙述的故事来源。
+                self._put("checkpoints", "goal_records/" + group.group_id, records)
             if not assessment.achieved:
-                for event in group.events:
-                    row = states[event["task_id"]]
-                    exhausted = self.get_checkpoint("group_clock", {}).get("round", 1) > self.config.max_rounds
-                    if not exhausted:
-                        self.connection.execute("UPDATE event_progress SET status='running',outcome=NULL,outcome_version=NULL WHERE event_id=?",
-                                                (event["task_id"],))
+                from simulation.NovelRestoreGoals import invalidate_group_acceptance
+                self._put("checkpoints", "goal_records", invalidate_group_acceptance(records, version=version,
+                    assessment_key="group_assessment/" + group.group_id,
+                    continuity_ok=assessment.continuity_ok and not assessment.contradictions))
+
+    def continue_group(self, group):
+        """为剩余状态条件重新开放行动位置；core_completed 与已提交历史不变。"""
+        self._writable()
+        from simulation.NovelRestoreGoals import goals_satisfied
+        progress = self.current()[2]
+        if (group.node_id, group.order) != (progress["node_id"], progress["group_order"]):
+            raise ValueError("只能继续当前事件组")
+        if goals_satisfied(self.get_checkpoint("goal_records", {})):
+            raise ValueError("逐项条件齐备后应先正式验收，不能继续安排多余行动")
+        with self.connection:
+            self.connection.execute("UPDATE event_progress SET status='running',outcome=NULL,outcome_version=NULL "
+                "WHERE node_id=? AND group_order=? AND status='completed'", (group.node_id, group.order))
 
     def publish_world(self):
-        from exporters.NovelRestoreExporter import NovelRestoreExporter
+        from storage.NovelRestoreExporter import NovelRestoreExporter
         NovelRestoreExporter(self).publish({"world_state.json": json.dumps(
             self.current()[1].model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n"}, "export/world")
 
-    def record_event_outcome(self, outcome: EventOutcome):
-        """登记世界的事件判断；超限和失败保留为未完成，不能放行后续组。"""
-        self._writable()
-        outcome = EventOutcome.model_validate(outcome.model_dump(mode="json"))
-        if outcome.run_id != self.run_id:
-            raise ValueError("事件结论不属于本次运行")
-        payload = encode(outcome.model_dump(mode="json"))
-        event = self.connection.execute("SELECT * FROM event_progress WHERE event_id=?", (outcome.event_id,)).fetchone()
-        if event is None:
-            raise ValueError("事件不存在")
-        if event["outcome"] is not None:
-            if event["outcome"] != payload:
-                raise ValueError("事件结论已保存，不能覆盖")
-            return event["outcome_version"]
-        version, _, progress = self.current()
-        if outcome.expected_version != version:
-            raise ValueError("事件结论的状态版本已不匹配")
-        if event["status"] != "running" or (event["node_id"], event["group_order"]) != (
-                progress["node_id"], progress["group_order"]):
-            raise ValueError("只能判断当前组正在模拟的事件")
-        for identity in outcome.action_ids:
-            row = self.connection.execute("SELECT payload,status FROM actions WHERE action_id=?", (identity,)).fetchone()
-            if row is None or row["status"] != "committed" or json.loads(row["payload"])["position"]["event_id"] != outcome.event_id:
-                raise ValueError("事件结论只能引用本事件已提交的行动")
-        if outcome.status == "completed" and event["last_action_id"] not in outcome.action_ids:
-            raise ValueError("完成结论必须包含本事件最新行动")
-        if outcome.status == "timed_out" and self.get_checkpoint("group_clock")["round"] <= self.config.max_rounds:
-            raise ValueError("事件尚未达到轮数上限")
-        with self.connection:
-            self.connection.execute("UPDATE event_progress SET status=?,outcome=?,outcome_version=? WHERE event_id=?",
-                                    (outcome.status, payload, version + 1, outcome.event_id))
-            self.connection.execute("UPDATE runtime SET version=? WHERE singleton=1", (version + 1,))
-        return version + 1
-
-    @staticmethod
-    def _memory_batches(action):
-        batches = defaultdict(list)
-        for record in action.memories:
-            batches[record.character_id].append(record)
-        return batches
-
     def _validate_action(self, action, *, catalog=None, validate_state=True):
+        """校验单项来源与内容；记忆唯一性由单行动或整批提交统一检查。"""
         if catalog is None and action.advance and action.advance.new_objects:
             raise ValueError("新增物品必须通过批次原子交接登记")
         catalog = catalog if catalog is not None else effective_catalog(self)
@@ -505,86 +522,36 @@ class NovelRestoreStorage(NovelRestoreRuntime):
             if action.proposal.mode == "think" and record.character_id != action.proposal.character_id and record.character_id not in (action.advance.observations if action.advance else {}):
                 raise ValueError("私有思考不能写入其他人物的记忆")
         if validate_state:
-            validate_references(apply_patch(state, action.state_patch), catalog)
-        for character, records in self._memory_batches(action).items():
-            self.validate_memories(character, records)
-
-    def commit_action(self, action: ConfirmedAction):
-        self._writable(allow_pending=True)
-        # 重新验证可变的 Pydantic 实例，避免调用方修改后绕过字段检查。
-        action = ConfirmedAction.model_validate(action.model_dump(mode="json"))
-        payload = encode(action.model_dump(mode="json"))
-        previous = self.connection.execute("SELECT * FROM actions WHERE action_id=?", (action.action_id,)).fetchone()
-        if previous is not None:
-            if previous["payload"] != payload:
-                raise ValueError("行动身份已绑定另一份内容，不能覆盖")
-            if previous["status"] == "prepared":
-                self.recover()
-            return previous["version"]
-        self._writable()
-        if self.get_checkpoint("wave"):
-            raise ValueError("已调度的并发批次须整体提交，不能拆成单独行动")
-        self._validate_action(action)
-        with self.connection:
-            self.connection.execute("INSERT INTO actions VALUES (?,?,'prepared',?)",
-                                    (action.action_id, payload, action.expected_version + 1))
-        self.recover()
-        return action.expected_version + 1
+            validate_references(apply_patch(state, action.state_patch), catalog, locations=self.manifest["locations"])
 
     def recover(self):
         self._writable(allow_pending=True)
         if self.get_checkpoint("pending_wave"):
             return self.recover_wave()
-        row = self.connection.execute("SELECT * FROM actions WHERE status='prepared'").fetchone()
-        if row is None:
-            self.publish_world()
-            self.publish_characters()
-            return False
-        action = ConfirmedAction.model_validate_json(row["payload"])
-        version, state, progress = self.current()
-        if version != action.expected_version:
-            raise ValueError("待交接行动与当前状态版本冲突，保留现场")
-        state = apply_patch(state, action.state_patch)
-        progress.update(stage="simulating", last_action_id=action.action_id)
-        clock = self.advance_clock(1, bool(action.completion and action.completion.achieved))
-        with self.connection:
-            self._put("checkpoints", "group_clock", clock)
-            views = self.get_checkpoint("views", {})
-            views.update({p: v.model_dump(mode="json") for p, v in action.observations.items()})
-            self._put("checkpoints", "views", views)
-            self.connection.execute("UPDATE runtime SET version=?,state=?,progress=? WHERE singleton=1",
-                                    (version + 1, state.model_dump_json(), encode(progress)))
-            self.connection.execute("UPDATE actions SET status='committed' WHERE action_id=?", (action.action_id,))
-            self.connection.execute("UPDATE event_progress SET last_action_id=?,last_round=?,last_turn=? WHERE event_id=?",
-                                    (action.action_id, action.position.round, action.position.turn, action.position.event_id))
-            if action.completion is not None:
-                position = action.position
-                exhausted = clock["round"] > self.config.max_rounds
-                if action.completion.achieved or exhausted:
-                    outcome = EventOutcome(run_id=self.run_id, event_id=position.event_id,
-                                           expected_version=version,
-                                           status="completed" if action.completion.achieved else "timed_out",
-                                           summary=action.completion.summary,
-                                           action_ids=[item.action_id for item in self.event_actions(position.event_id)])
-                    self.connection.execute("UPDATE event_progress SET status=?,outcome=?,outcome_version=? WHERE event_id=?",
-                                            (outcome.status, outcome.model_dump_json(), version + 1, position.event_id))
+        if self.connection.execute("SELECT 1 FROM actions WHERE status='prepared'").fetchone():
+            raise ValueError("待交接行动缺少完整批次记录，不能退回单行动提交；保留现场")
         self.publish_world()
         self.publish_characters()
-        return True
+        return False
 
     def _put(self, table, key, payload):
         # table 仅由下列固定调用方提供，不接收外部输入。
         self.connection.execute(f"INSERT INTO {table} VALUES (?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
-                                (key, encode(payload)))
+                                (key, storage_encode(payload)))
 
     def get_checkpoint(self, key, default=None):
         row = self.connection.execute("SELECT payload FROM checkpoints WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else default
 
     def set_checkpoint(self, key, payload):
+        self.set_checkpoints({key: payload})
+
+    def set_checkpoints(self, checkpoints):
+        """相关检查点一次交接；只读或尚未恢复的运行不接受新的准备状态。"""
         self._writable()
         with self.connection:
-            self._put("checkpoints", key, payload)
+            for key, payload in checkpoints.items():
+                self._put("checkpoints", key, payload)
 
     def get_job(self, key):
         row = self.connection.execute("SELECT payload FROM jobs WHERE key=?", (key,)).fetchone()
@@ -617,34 +584,57 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                 raise ValueError("指定停止事件组尚未完成草稿保存")
         progress.update(stage=stage, error=error)
         with self.connection:
-            self.connection.execute("UPDATE runtime SET progress=? WHERE singleton=1", (encode(progress),))
+            self.connection.execute("UPDATE runtime SET progress=? WHERE singleton=1", (storage_encode(progress),))
 
     def event_states(self):
         return {row["event_id"]: dict(row) for row in self.connection.execute("SELECT * FROM event_progress")}
 
-    def event_actions(self, event_id=None):
+    def event_action_ids(self, event_id):
+        """进度引用校验只读已提交身份，不解析正文、记忆和审核附件。"""
+        return {row[0] for row in self.connection.execute(
+            "SELECT action_id FROM actions WHERE status='committed' AND json_extract(payload,'$.position.event_id')=?",
+            (event_id,))}
+
+    def event_actions(self, event_id=None, *, action_ids=None):
         where, values = ("", ()) if event_id is None else (" AND json_extract(payload,'$.position.event_id')=?", (event_id,))
-        return [ConfirmedAction.model_validate_json(row[0]) for row in self.connection.execute(
+        if action_ids is not None:
+            if not action_ids:
+                return []
+            where += " AND action_id IN (SELECT value FROM json_each(?))"
+            values += (json.dumps(sorted(action_ids)),)
+        return [self._read_action(row[0]) for row in self.connection.execute(
             "SELECT payload FROM actions WHERE status='committed'" + where + " ORDER BY version", values)]
 
     def get_action(self, action_id):
         row = self.connection.execute("SELECT payload FROM actions WHERE action_id=? AND status='committed'", (action_id,)).fetchone()
-        return ConfirmedAction.model_validate_json(row[0]) if row else None
+        return self._read_action(row[0]) if row else None
+
+    def _read_action(self, payload):
+        if self.manifest["format"] < 21:
+            from storage.NovelRestoreLegacyRead import action_record
+            return ConfirmedAction.model_validate(action_record(json.loads(payload)))
+        return ConfirmedAction.model_validate_json(payload)
 
     def get_draft(self, identity):
         """当前格式按组读取；旧运行的只读 API 保留原来的事件键。"""
         if self.manifest["format"] < 17:
             row = self.connection.execute("SELECT payload FROM drafts WHERE event_id=?", (identity,)).fetchone()
-            return EventDraft.model_validate_json(row[0]) if row else None
+            from storage.NovelRestoreLegacyRead import event_draft
+            return EventDraft.model_validate(event_draft(json.loads(row[0]))) if row else None
         row = self.connection.execute("SELECT payload,digest FROM drafts WHERE group_id=?", (identity,)).fetchone()
         if row is None:
             return None
         self.check_draft_digest(row)
-        schema = Format17GroupDraft if self.manifest["format"] == 17 else GroupDraft
+        if self.manifest["format"] == 17:
+            schema = Format17GroupDraft
+        elif self.manifest["format"] < 20:
+            schema = Format19GroupDraft
+        else:
+            schema = GroupDraft
         return schema.model_validate_json(row["payload"])
 
     def group_actions(self, node_id, order):
-        return [ConfirmedAction.model_validate_json(row[0]) for row in self.connection.execute(
+        return [self._read_action(row[0]) for row in self.connection.execute(
             """SELECT payload FROM actions WHERE status='committed'
                AND json_extract(payload,'$.position.node_id')=? AND json_extract(payload,'$.position.group_order')=?
                ORDER BY version""", (node_id, order))]
@@ -719,320 +709,121 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                                     (group_id, draft.draft_id, payload, sha256(payload.encode()).hexdigest()))
 
     def reserve(self, key, occurrence, body, limit, *, can_send, scope="simulation", budget_config=None,
-                prior_usage=None):
+                prior_usage=None, billable=True):
         self._writable()
         # 重演继承费用账本，但请求缓存须隔离；运行身份无需进入人物提示。
-        key = sha256(encode([self.run_id, key]).encode()).hexdigest()
-        row = self.connection.execute("SELECT * FROM calls WHERE scope=? AND request_key=? AND occurrence=? AND ended IS NOT NULL ORDER BY id DESC LIMIT 1",
+        key = fingerprint([self.run_id, key])
+        row = self.connection.execute("SELECT * FROM calls WHERE scope=? AND request_key=? AND occurrence=? ORDER BY id DESC LIMIT 1",
                                       (scope, key, occurrence)).fetchone()
         if row is not None:
-            return dict(row), True
+            if row["ended"] is None:
+                if row["id"] not in getattr(self, "_retry_unknown_calls", set()):
+                    raise RunStopped("同一请求已有发送记录但未收到回执，无法确认是否送达；"
+                                     "核对预算后可显式 resume --retry-unknown，保留账目与已完成任务")
+            elif row["id"] not in getattr(self, "_retry_unsent_calls", set()):
+                return dict(row), True
         if not can_send:
             raise RunStopped("未提供模型密钥，不能发出新请求")
-        self.check_budget(budget_config or self.config, scope, prior_usage)
-        if self.call_count(scope) >= limit:
+        self.check_budget(budget_config or self.config, scope, prior_usage, request=storage_encode(body) if billable else None)
+        if limit is not None and self.call_count(scope) >= limit:
             raise RunStopped("累计模型调用预算已用尽")
         with self.connection:
-            from model.ModelClient import CALL_SCOPE
+            from common.Runtime import CALL_SCOPE
             job = body.get("job") or (CALL_SCOPE.get() or ("unknown",))[0]
             role = job.split("/", 1)[0]
-            role = "character" if role in ("recall", "memory", "summary") else "narrator" if role == "batch" else "world" if role == "environment" else role
-            role = CALL_ROLE.get() or role
+            role = CALL_ROLE.get() or {"recall": "character", "memory": "character", "summary": "character",
+                                       "batch": "narrator", "environment": "world"}.get(role, role)
             cursor = self.connection.execute("INSERT INTO calls(request_key,occurrence,request,started,scope,role) VALUES (?,?,?,?,?,?)",
-                                             (key, occurrence, encode(body), datetime.now(timezone.utc).isoformat(), scope, role))
+                                             (key, occurrence, storage_encode(body), datetime.now(timezone.utc).isoformat(), scope, role))
+            if row is not None:
+                self._put("checkpoints", "request_retry/" + str(cursor.lastrowid),
+                          {"previous_call_id": row["id"], "reason": ("explicit_retry_unsent"
+                           if row["ended"] is not None else "explicit_retry_unknown")})
+                self._retry_unknown_calls.discard(row["id"])
+                self._retry_unsent_calls.discard(row["id"])
+        self._inflight_calls.add(cursor.lastrowid)
         return {"id": cursor.lastrowid}, False
+
+    def allow_unknown_retries(self):
+        """One invocation, retry orphaned or known-unsent calls; preserve the ledger.
+
+        The workflow calls this after checking the execution fingerprint. New
+        uncertain deliveries remain protected until another explicit resume.
+        """
+        self._writable()
+        self._retry_unknown_calls = {row[0] for row in self.connection.execute(
+            "SELECT id FROM calls WHERE ended IS NULL AND scope='simulation'")} - self._inflight_calls
+        # Explicit resume may retry known pre-send failures, but never successful
+        # receipts or new failures created during this invocation. Keep the ledger.
+        self._retry_unsent_calls = {row[0] for row in self.connection.execute(
+            "SELECT id FROM calls WHERE ended IS NOT NULL AND scope='simulation' "
+            "AND status IS NULL AND error IN ('ConnectError','ConnectTimeout','PoolTimeout')")}
+
+    def release_call(self, call_id):
+        """本写入者不再等待网络；仅真实回执或已知未送达才能结清账目。"""
+        self._inflight_calls.discard(call_id)
 
     def received(self, call_id, status, raw, usage):
         self._writable()
         with self.connection:
             self.connection.execute("UPDATE calls SET ended=?,status=?,response=?,usage=? WHERE id=?",
-                                    (datetime.now(timezone.utc).isoformat(), status, raw, encode(usage), call_id))
+                                    (datetime.now(timezone.utc).isoformat(), status, raw, storage_encode(usage), call_id))
+        self.release_call(call_id)
 
     def failed(self, call_id, error):
         self._writable()
         with self.connection:
             self.connection.execute("UPDATE calls SET ended=?,error=? WHERE id=?",
                                     (datetime.now(timezone.utc).isoformat(), error, call_id))
-
-    def narrative_source(self):
-        """仅使用库中已确认资料，不读取草稿导出文件或原小说。"""
-        if self.connection.execute("SELECT json_extract(progress,'$.stage') FROM runtime WHERE singleton=1").fetchone()[0] != "simulation_complete":
-            raise ValueError("全部模拟完成后才能开始叙述")
-        if self.manifest["format"] < self.FORMAT:
-            raise ValueError("旧运行的草稿未归档当前协议的行动前回想，只能查看历史结果")
-        drafts, actions, shared, characters = [], {}, {}, {}
-        for node in self.manifest["nodes"]:
-            for group in node["groups"]:
-                draft = self.get_draft(group["group_id"])
-                if (draft is None or draft.run_id != self.run_id or draft.node_id != node["node_id"]
-                        or draft.group_id != group["group_id"] or draft.group_order != group["order"]
-                        or draft.node_order != node["order"] or draft.event_ids != group["event_ids"]):
-                    raise ValueError("叙述来源缺失或组草稿与冻结时间轴不一致")
-                drafts.append(draft.model_dump(mode="json", exclude={"materials", "shared_materials"}))
-                characters.update({p: {"role_name": name} for p, name in draft.participant_names.items()})
-                for event in draft.event_ids:
-                    actions[event] = []
-                for material in draft.materials:
-                    actions[material.position.event_id].append(material.model_dump(mode="json"))
-                shared.update({m.shared_id: m.model_dump(mode="json") for m in draft.shared_materials})
-        if not drafts:
-            raise ValueError("叙述来源必须包含已验收的组草稿")
-        return {"run_id": self.run_id, "characters": characters, "drafts": drafts,
-                "actions": actions, "shared_materials": shared}
-
-    def create_narrative(self, config, binding, *, selection=None):
-        self._writable()
-        config = NovelRestoreNarrativeConfig.model_validate(config.model_dump(mode="json"))
-        if self.connection.execute("SELECT 1 FROM narratives WHERE key=?", (config.version_id,)).fetchone():
-            raise ValueError("叙述版本已存在，请使用 resume 或选择新的版本身份")
-        state = {"config": config.model_dump(mode="json"), "binding": binding,
-                 "source_hash": sha256(encode(self.narrative_source()).encode()).hexdigest(),
-                 "stage": "initialized", "error": None, "epoch": 0, "sequence": 1,
-                 "assignment": None, "plan": None, "prose": {}, "links": {},
-                 "pending": None, "reviews": [], "issues": [], "prose_meta": {}, "batch_reviews": []}
-        if selection is not None:
-            state["selection"] = selection
-        with self.connection:
-            self._put("narratives", config.version_id, state)
-
-    def narrative(self, version_id):
-        row = self.connection.execute("SELECT payload FROM narratives WHERE key=?", (version_id,)).fetchone()
-        if row is None:
-            raise ValueError("叙述版本不存在：" + version_id)
-        return json.loads(row[0])
-
-    def update_narrative(self, version_id, **updates):
-        self._writable()
-        if updates.keys() - {"stage", "error", "assignment", "pending"}:
-            raise ValueError("正文与计划须通过专用事务更新")
-        state = self.narrative(version_id)
-        state.update(updates)
-        with self.connection:
-            self._put("narratives", version_id, state)
-
-    def check_narrative_source(self, version_id):
-        source = self.narrative_source()
-        if sha256(encode(source).encode()).hexdigest() != self.narrative(version_id)["source_hash"]:
-            raise ValueError("叙述来源草稿或行动已变化，不能继续旧版本")
-        return source
-
-    def validate_narrative_plan(self, version_id, plan):
-        plan = NarrativePlan.model_validate(plan.model_dump(mode="json"))
-        config = self.narrative(version_id)["config"]
-        if (plan.run_id, plan.version_id, plan.requirements, plan.revision) != (
-                self.run_id, version_id, config["requirements"], 1):
-            raise ValueError("叙述计划身份或版本要求不匹配")
-        drafts = {row["draft_id"]: row for row in self.check_narrative_source(version_id)["drafts"]}
-        if {(fragment.draft_id, fragment.event_id) for fragment in plan.fragments} != {
-                (key, event) for key, draft in drafts.items() for event in draft["event_ids"]}:
-            raise ValueError("叙述计划必须覆盖全部来源草稿及其事件")
-        for fragment in plan.fragments:
-            self.validate_fragment(fragment, drafts)
-        spec = config["version"]
-        if spec["length"] is not None and sum(f.length_budget for f in plan.fragments) != spec["length"]:
-            raise ValueError("片段篇幅预算总和须等于版本目标长度")
-        by_id = {f.fragment_id: f for f in plan.fragments}
-        if any(c.length_budget != sum(by_id[i].length_budget for i in c.fragment_ids) for c in plan.chapters):
-            raise ValueError("每章篇幅预算须等于所含片段预算之和")
-        if any(not link.acceptance for link in plan.links):
-            raise ValueError("关联须明确正文中的成立和回收条件")
-        return plan
-
-    def validate_fragment(self, fragment, drafts):
-        draft = drafts.get(fragment.draft_id)
-        if not draft or fragment.event_id not in draft["event_ids"] or (
-                set(fragment.action_ids) - set(draft["event_action_ids"][fragment.event_id])):
-            raise ValueError("片段的草稿、事件或行动引用不一致")
-        if not fragment.action_ids or not fragment.purpose or not fragment.viewpoint or fragment.length_budget is None:
-            raise ValueError("片段须明确具体行动来源、叙述目的、视角和篇幅预算")
-        if fragment.viewpoint_role_id is not None and not any(
-                fragment.viewpoint_role_id in d["participant_ids"] for d in drafts.values()):
-            raise ValueError("片段视角引用未知人物")
-        if fragment.knowledge_action_id:
-            if not any(fragment.knowledge_action_id in d["action_ids"] for d in drafts.values()):
-                raise ValueError("人物知情时点须指向实际已提交行动")
-            if fragment.knowledge_action_id not in fragment.action_ids and not fragment.knowledge_basis:
-                raise ValueError("使用内容来源之外的知情时点须说明依据")
-
-    def save_narrative_plan(self, version_id, plan):
-        self._writable()
-        plan = self.validate_narrative_plan(version_id, plan)
-        state = self.narrative(version_id)
-        payload = plan.model_dump(mode="json")
-        if state["plan"] is not None:
-            if state["plan"] != payload:
-                raise ValueError("已接收的叙述落位不能覆盖；重新落位请另建版本")
-            return
-        state.update(plan=payload, stage="writing", epoch=state["epoch"] + 1,
-                     links={link.link_id: {"link": link.model_dump(mode="json"), "revisions": {}} for link in plan.links})
-        with self.connection:
-            self._put("narratives", version_id, state)
-
-    @staticmethod
-    def link_current(record, prose):
-        link = record["link"]
-        ends = [link["from_fragment"], link["to_fragment"]]
-        return (all(end in prose for end in ends) and
-                record["revisions"] == {end: prose[end]["revision"] for end in ends})
-
-    def select_narrative_links(self, version_id, selection, required=()):
-        """校验拟修改范围并在副本上应用关系变更；不触碰当前正文。"""
-        selection = NarrativeSelection.model_validate(selection.model_dump(mode="json"))
-        state = self.narrative(version_id)
-        if state["plan"] is None:
-            raise ValueError("先保存完整章节片段落位")
-        plan = NarrativePlan.model_validate(state["plan"])
-        targets = set(selection.fragment_ids)
-        if targets - set(plan.reading_order) or set(required) - targets:
-            raise ValueError("联合任务包含未知片段或遗漏必需目标")
-        links = state["links"]  # narrative() 每次解码新副本。
-        for operation in [*selection.upsert_links, *selection.remove_links]:
-            old = links.get(operation.link_id)
-            if old and {old["link"]["from_fragment"], old["link"]["to_fragment"]} - targets:
-                raise ValueError("修改已有关系必须共同读取其原有两端")
-        for removal in selection.remove_links:
-            if removal.link_id not in links:
-                raise ValueError("不能删除不存在的叙述关系")
-            del links[removal.link_id]
-        for link in selection.upsert_links:
-            if not link.acceptance:
-                raise ValueError("关联须明确正文中的成立和回收条件")
-            if {link.from_fragment, link.to_fragment} - targets:
-                raise ValueError("新建或修改关系必须共同处理其两端")
-            old = links.get(link.link_id)
-            if old is None or old["link"] != link.model_dump(mode="json"):
-                links[link.link_id] = {"link": link.model_dump(mode="json"), "revisions": {}}
-        NarrativePlan.model_validate({**state["plan"], "links": [row["link"] for row in links.values()]})
-        return links
-
-    def preview_narrative_batch(self, version_id, task_id, epoch, selection, batch, review=None):
-        state = self.narrative(version_id)
-        if state["stage"] in ("complete", "incomplete") or epoch != state["epoch"]:
-            raise ValueError("叙述版本已结束或正文依据版本已变化")
-        pending = state["pending"]
-        if not pending or pending["task_id"] != task_id or pending.get("selection") != selection.model_dump(mode="json"):
-            raise ValueError("正文必须绑定已保存的联合任务与选取范围")
-        links = self.select_narrative_links(version_id, selection, pending["required"])
-        batch = NarrativeBatch.model_validate(batch.model_dump(mode="json"))
-        targets = set(selection.fragment_ids)
-        if {row.fragment_id for row in batch.texts} != targets:
-            raise ValueError("联合交付必须恰好包含本次目标的全部正文")
-        internal = {key for key, row in links.items()
-                    if {row["link"]["from_fragment"], row["link"]["to_fragment"]} <= targets}
-        if set(batch.confirmed_link_ids) != internal:
-            raise ValueError("须共同核对本次目标之间的全部有效关联")
-        for text in batch.texts:
-            if not text.summary.strip():
-                raise ValueError("正文须提供供后续检索和全书复核的内容摘要")
-            old = state["prose"].get(text.fragment_id)
-            if old and old["text"] == text.text:
-                continue
-            revision = old["revision"] + 1 if old else 1
-            if revision > state["config"]["max_revisions"] + 1:
-                raise NarrativeLimitReached("片段正文修订上限已用尽：" + text.fragment_id)
-            state["prose"][text.fragment_id] = ProseFragment(
-                version_id=version_id, plan_revision=state["plan"]["revision"], fragment_id=text.fragment_id,
-                revision=revision, task_id=task_id, text=text.text).model_dump(mode="json")
-            state.setdefault("prose_meta", {})[text.fragment_id] = {
-                "summary": text.summary, "revealed": text.revealed, "change": text.change}
-        for identity in internal:
-            link = links[identity]["link"]
-            links[identity]["revisions"] = {end: state["prose"][end]["revision"]
-                                            for end in (link["from_fragment"], link["to_fragment"])}
-        if review is not None:
-            if not review.approved:
-                raise ValueError("联合正文语义检查未通过，不得保存为有效正文")
-            for identity in review.preserved_link_ids:
-                if identity not in links:
-                    raise ValueError("语义检查保留了未知关联")
-                ends = {links[identity]["link"]["from_fragment"], links[identity]["link"]["to_fragment"]}
-                if not ends.intersection(targets) or not ends <= state["prose"].keys():
-                    raise ValueError("只能保留已读取正文的直接关联")
-                links[identity]["revisions"] = {end: state["prose"][end]["revision"] for end in ends}
-            known = set(NarrativePlan.model_validate(state["plan"]).reading_order)
-            if set(review.affected_fragment_ids) - (known - targets):
-                raise ValueError("影响传播只能标记本次目标之外的实际片段")
-            state.setdefault("batch_reviews", []).append({"task_id": task_id, "result": review.model_dump(mode="json")})
-        issues = [i for i in state["issues"] if set(i["fragment_ids"]) - targets]
-        if review is not None:
-            issues.extend({"fragment_ids": [i], "description": "本次表达、已有线索呈现或读者揭示变化，需要复核"}
-                          for i in dict.fromkeys(review.affected_fragment_ids))
-        # 未经语义核对的外部关系保留旧确认，自动进入后续联合任务。
-        state.update(links=links, epoch=epoch + 1, sequence=state["sequence"] + 1,
-                     pending=None, issues=issues, stage="writing", error=None)
-        return state
-
-    def commit_narrative_batch(self, version_id, task_id, epoch, selection, batch, review=None):
-        self._writable()
-        if review is None or not review.approved:
-            raise ValueError("保存联合正文前必须通过世界角色的语义核对")
-        self.check_narrative_source(version_id)
-        payload = encode({"epoch": epoch, "selection": selection.model_dump(mode="json"), "batch": batch.model_dump(mode="json"),
-                          "review": review.model_dump(mode="json") if review else None})
-        old = self.connection.execute("SELECT payload FROM narrative_batches WHERE version_id=? AND task_id=?",
-                                      (version_id, task_id)).fetchone()
-        if old is not None:
-            if old[0] != payload:
-                raise ValueError("联合任务已经绑定另一份结果")
-            return
-        state = self.preview_narrative_batch(version_id, task_id, epoch, selection, batch, review)
-        with self.connection:
-            self.connection.execute("INSERT INTO narrative_batches VALUES (?,?,?)", (version_id, task_id, payload))
-            self._put("narratives", version_id, state)
-
-    def narrative_status(self, version_id):
-        state = self.narrative(version_id)
-        order = NarrativePlan.model_validate(state["plan"]).reading_order if state["plan"] else []
-        scope = NarrativeScope.scope_name(version_id)
-        receipt = self.get_checkpoint("export/narrative/" + version_id, {})
-        return {"version_id": version_id, "stage": state["stage"], "error": state["error"],
-                "published": state["stage"] == "complete" and receipt.get("complete_epoch") == state["epoch"] and not receipt.get("pending"),
-                "plan_ready": state["plan"] is not None, "fragments": len(order), "written": len(state["prose"]),
-                "missing": [identity for identity in order if identity not in state["prose"]],
-                "pending_links": [key for key, row in state["links"].items() if not self.link_current(row, state["prose"])],
-                "issues": state["issues"], "review_count": len(state["reviews"]),
-                "calls": self.call_count(scope)}
-
-    def record_narrative_review(self, version_id, epoch, review):
-        self._writable()
-        review = NarrativeReview.model_validate(review.model_dump(mode="json"))
-        state, status = self.narrative(version_id), self.narrative_status(version_id)
-        if state["epoch"] != epoch or state["pending"] or not status["plan_ready"] or status["missing"] or status["pending_links"]:
-            raise ValueError("内容核对必须针对完整且关联已落实的当前正文")
-        if state["stage"] in ("complete", "incomplete") or len(state["reviews"]) > state["config"]["max_review_rounds"]:
-            raise ValueError("内容核对已结束或超过配置上限")
-        if any(set(issue.fragment_ids) - set(state["prose"]) for issue in review.issues):
-            raise ValueError("内容核对的问题引用了未知片段")
-        self.check_narrative_source(version_id)
-        state["reviews"].append({"epoch": epoch, "result": review.model_dump(mode="json")})
-        state.update(issues=[issue.model_dump(mode="json") for issue in review.issues], error=None,
-                     stage="complete" if review.approved else "writing")
-        with self.connection:
-            self._put("narratives", version_id, state)
+        self.release_call(call_id)
 
     def _visible_actions(self, through_version=None):
         version = self.current()[0] if through_version is None else through_version
         return {row[0] for row in self.connection.execute(
             "SELECT action_id FROM actions WHERE status='committed' AND version<=?", (version,))}
 
-    def memories(self, character_id, *, through_version=None):
+    def memories(self, character_id, *, through_version=None, offset=0, limit=None):
+        return self._committed_memories(character_id, through_version, offset=offset, limit=limit)
+
+    def _committed_memories(self, character_id, through_version, *, world_links=None, offset=0, limit=None):
+        if type(offset) is not int or offset < 0 or limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("记忆分页偏移和数量须为非负整数")
         self.memory.path(character_id)  # 人物边界必须先验证。
         if self.manifest["format"] < 8:
-            return self.memory.read(character_id, committed_actions=self._visible_actions(through_version))
+            records = self.memory.read(character_id, committed_actions=self._visible_actions(through_version))
+            return records[offset:None if limit is None else offset + limit]
         version = self.current()[0] if through_version is None else through_version
-        rows = self.connection.execute("""SELECT actions.version AS visible_version, 0 AS phase,
-                   CAST(memory.key AS INTEGER) AS item, memory.value AS payload
+        # 仅世界按实体筛选时，另读该条记忆所在来源和接收者的客观映射。
+        def correspondences(path):
+            if world_links is None:
+                return ""
+            return f""", (SELECT json_extract(view.value, '$.correspondences')
+                          FROM json_each(actions.payload, '{path}') AS view
+                          WHERE view.key=json_extract(memory.value, '$.character_id')) AS mappings"""
+        rows = self.connection.execute(f"""SELECT actions.version AS visible_version, 0 AS phase,
+                   CAST(memory.key AS INTEGER) AS item, memory.value AS payload {correspondences('$.observations')}
             FROM actions, json_each(actions.payload, '$.memories') AS memory
             WHERE actions.status='committed' AND actions.version<=?
               AND json_extract(memory.value, '$.character_id')=?
             UNION ALL
             SELECT json_extract(actions.payload, '$.advance.version_after'), 1,
-                   CAST(memory.key AS INTEGER), memory.value
+                   CAST(memory.key AS INTEGER), memory.value {correspondences('$.advance.observations')}
             FROM actions, json_each(actions.payload, '$.advance.memories') AS memory
             WHERE actions.status='committed' AND json_extract(actions.payload, '$.advance.version_after')<=?
               AND json_extract(memory.value, '$.character_id')=?
-            ORDER BY visible_version, phase, item""", (version, character_id, version, character_id))
-        return [MemoryRecord.model_validate_json(row["payload"]) for row in rows]
+            ORDER BY visible_version, phase, item LIMIT ? OFFSET ?""",
+            (version, character_id, version, character_id, -1 if limit is None else limit, offset))
+        records = []
+        for row in rows:
+            memory = MemoryRecord.model_validate_json(row["payload"])
+            records.append(memory)
+            if world_links is not None and memory.perceived_ids and row["mappings"]:
+                seen = set(memory.perceived_ids)
+                world_links[memory.memory_id] = {
+                    m["actual_id"] for m in json.loads(row["mappings"])
+                    if m["perceived_id"] in seen and m["actual_kind"] in ("role", "object", "location")
+                    and m.get("actual_id") is not None}
+        return records
 
     def validate_memories(self, character_id, records):
         existing = {m.memory_id for m in self.memories(character_id)}
@@ -1043,7 +834,7 @@ class NovelRestoreStorage(NovelRestoreRuntime):
                 raise ValueError("记忆编号重复，或关联不是本人的已保存记忆")
             existing.add(record.memory_id)
 
-    def search_personal_memories(self, character_id, query):
+    def search_personal_memories(self, character_id, query, *, cues=()):
         """人物自己提出的问题只命中当前运行中本人已提交的主观记忆正文。"""
         limit = min(self.config.memory_candidates, self.config.recent_memories + self.config.related_memories)
         if not query or not query.strip() or not limit:
@@ -1053,10 +844,12 @@ class NovelRestoreStorage(NovelRestoreRuntime):
             raise MemoryCorruption("回想记录须来自本次运行中的本人")
         if len({r.memory_id for r in records}) != len(records):
             raise MemoryCorruption("本人主观历史包含重复的记忆编号")
-        return self.memory.search(records, query, limit)
+        return self.memory.search(records, query, limit, cues=cues)
 
     def retrieve_memories(self, character_id, *, query="", related_ids=(), through_version=None, relevant=None):
-        return self.memory.select(self.memories(character_id, through_version=through_version),
+        world_links = {} if related_ids else None
+        records = self._committed_memories(character_id, through_version, world_links=world_links)
+        return self.memory.select(records, world_links=world_links,
                                   query=query, related_ids=related_ids, recent=self.config.recent_memories,
                                   relevant=self.config.related_memories if relevant is None else relevant)
 
@@ -1064,7 +857,8 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         row = self.connection.execute("SELECT version,progress FROM runtime WHERE singleton=1").fetchone()
         version, progress = row["version"], json.loads(row["progress"])
         counts, diagnostics = {}, []
-        visible = self._visible_actions(version)
+        committed = self.connection.execute(
+            "SELECT COUNT(*) FROM actions WHERE status='committed' AND version<=?", (version,)).fetchone()[0]
         for character in self.manifest["catalog"]["role"]:
             try:
                 counts[character] = len(self.memories(character, through_version=version))
@@ -1075,49 +869,19 @@ class NovelRestoreStorage(NovelRestoreRuntime):
         events = ({row["event_id"]: dict(row) for row in self.connection.execute(
             "SELECT event_id,node_id,group_order,status,last_action_id,last_round,last_turn FROM event_progress")}
                   if self.manifest["format"] >= 2 else None)
+        deferred_exports = ([{"key": row["key"], **receipt["error"]}
+                             for row in self.connection.execute("SELECT key,payload FROM checkpoints WHERE key='export' OR key LIKE 'export/%' ORDER BY key")
+                             if (receipt := json.loads(row["payload"])).get("error")]
+                            if self.manifest["format"] >= 3 else [])
         return {"run_id": self.run_id, "repository": str(self.config.repository), "version": version,
-                "progress": progress, "committed_actions": len(visible), "pending_actions": pending,
-                "memory_counts": counts, "diagnostics": diagnostics, "retrieval_mode": "text_and_entities",
+                "progress": progress, "committed_actions": committed, "pending_actions": pending,
+                "memory_counts": counts, "diagnostics": diagnostics, "deferred_exports": deferred_exports,
+                "retrieval_mode": "text_and_entities",
                 "events": events, **({"calls": self.connection.execute("SELECT COUNT(*) FROM calls").fetchone()[0],
+                                      "pending_group_summary": self.get_checkpoint("pending_group_summary"),
                                       "unknown_calls": self.connection.execute("SELECT COUNT(*) FROM calls WHERE ended IS NULL").fetchone()[0],
                                       "drafts": self.connection.execute("SELECT COUNT(*) FROM drafts").fetchone()[0],
                                       "usage": self.usage()}
                                      if self.manifest["format"] >= 3 else {}),
                 **({"narratives": {row[0]: self.narrative_status(row[0]) for row in self.connection.execute("SELECT key FROM narratives ORDER BY key")}}
                    if self.manifest["format"] >= 17 else {})}
-
-
-class NarrativeScope:
-    """同一账本按叙述版本隔离任务及预算；不复制模型请求实现。"""
-    def __init__(self, storage, version_id, *, selection_config=None):
-        self.storage = storage
-        self.prior_usage = {}
-        if selection_config is not None:
-            self.scope = "selection/" + quote(version_id, safe="")
-            self.config = selection_config
-            return
-        self.scope = self.scope_name(version_id)
-        state = storage.narrative(version_id)
-        self.config = NovelRestoreNarrativeConfig.model_validate(state["config"])
-        self.prior_usage = state.get("selection", {}).get("usage", {})
-
-    @staticmethod
-    def scope_name(version_id):
-        return "narrative/" + quote(version_id, safe="")
-
-    def get_job(self, key):
-        return self.storage.get_job(self.scope + "/" + key)
-
-    def save_job(self, key, payload):
-        self.storage.save_job(self.scope + "/" + key, payload)
-
-    def reserve(self, key, occurrence, body, limit, *, can_send):
-        remaining = min(limit, self.config.max_calls) - self.prior_usage.get("calls", 0)
-        return self.storage.reserve(key, occurrence, body, remaining, can_send=can_send,
-                                    scope=self.scope, budget_config=self.config, prior_usage=self.prior_usage)
-
-    def received(self, call_id, status, raw, usage):
-        self.storage.received(call_id, status, raw, usage)
-
-    def failed(self, call_id, error):
-        self.storage.failed(call_id, error)
